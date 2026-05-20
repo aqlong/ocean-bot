@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1778516568056,
+      "tag": "0000_aspiring_tusk",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1778616000000,
+      "tag": "0001_backlog_item",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1778803200000,
+      "tag": "0002_backlog_severity",
+      "breakpoints": true
+    }
+  ]
+}

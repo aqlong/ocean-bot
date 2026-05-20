@@ -1,0 +1,12 @@
+[build]
+builder = "NIXPACKS"
+# Nixpacks already ran `npm ci` in an earlier stage; redundant ci here
+# races the BuildKit node_modules cache mount (EBUSY). Just build.
+# See memory: ref_railway_deploy_gotchas.md.
+buildCommand = "npm run build"
+watchPatterns = ["tools/ocean-bot/dashboard/**"]
+
+[deploy]
+startCommand = "npm run start"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
