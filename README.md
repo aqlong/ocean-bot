@@ -4,6 +4,8 @@ An autonomous continuous-development agent that runs Claude on a tick loop, with
 
 Extracted from a private monorepo where it does real work driving improvements into a production codebase. The code is the documentation here. This is engineering shared for inspection, not a polished framework for general use.
 
+I write about the engineering behind this at [aaronlongnion.substack.com](https://aaronlongnion.substack.com).
+
 ## What it does
 
 On every tick (default: ~5 minutes):
