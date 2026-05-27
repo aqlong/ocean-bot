@@ -43,6 +43,15 @@ export interface StaleOpenSweepResult {
   fixedIds: string[];
 }
 
+/** Sweep result for stale phantom 'running' rows that the runner left
+ *  mid-state (SIGKILL, OOM, or a DB-write-after-process-died race).
+ *  Shape mirrors StaleOpenSweepResult so the /health dashboard can
+ *  render both with the same component. */
+export interface StalePhantomRunningResult {
+  fixedCount: number;
+  fixedIds: string[];
+}
+
 /** Sweep result for detect-only loop detection. The bot doesn't auto-
  *  block these (we'd risk false-positives killing legitimate retries);
  *  surface to the operator instead. */
@@ -74,6 +83,8 @@ export interface HealthSweepState {
   stuckPreflight: StuckTaskGroup[];
   /** Read-only detection: approved runs that never shipped. */
   staleApproved: StuckTaskGroup[];
+  /** Auto-fixed: 'running' rows >24h old with no terminal event. */
+  stalePhantomRunning: StalePhantomRunningResult;
 }
 
 export const HEALTH_SWEEP_STATE_KEY = "health_sweep_last_run";
@@ -82,6 +93,11 @@ const DEFAULT_NOOP_THRESHOLD = 3;
 const DEFAULT_PREFLIGHT_THRESHOLD = 3;
 const DEFAULT_LOOKBACK_HOURS = 7 * 24;
 const DEFAULT_APPROVED_STALE_HOURS = 72;
+/** Hold-fire window for phantom 'running' rows. The runner's inner
+ *  ceiling is a 30-min process timeout; legitimate opus runs on a
+ *  complex backlog item can run for tens of minutes. Anything past 24h
+ *  is definitely a SIGKILL or DB-write-after-process-died race. */
+const DEFAULT_RUNNING_STALE_HOURS = 24;
 
 /** AUTO-FIX: close backlog items that have a shipped run referencing
  *  them but somehow stayed status='open'. The query joins ocean_bot_run
@@ -114,6 +130,56 @@ export async function sweepStaleOpenBacklogItems(): Promise<StaleOpenSweepResult
     return { fixedCount: fixedIds.length, fixedIds };
   } catch (e) {
     log.error("health_sweep.sweepStaleOpenBacklogItems failed", {
+      err: errMsg(e),
+    });
+    return { fixedCount: 0, fixedIds: [] };
+  }
+}
+
+/** AUTO-FIX: flip 'running' rows older than `maxHours` to 'failed' with
+ *  a phantom-cleanup blocker. These rows are runner-leftovers from a
+ *  SIGKILL'd process or a DB-write-after-process-died race, the inner
+ *  30-min process timeout in runner.ts would have flipped any
+ *  legitimately-active run to 'failed' long before this fires.
+ *
+ *  Parallel to journal.ts#cleanupPhantomRuns, which targets the
+ *  shipped+local+null-sha+null-decision phantom class. This targets the
+ *  status='running' class, which has had no auto-cleanup until now and
+ *  was hit in prod 2026-05-26 (run 037JZAZZGFN3MHP05170QMH0 sat for 26h).
+ *
+ *  Returns the ids of rows flipped so /health can show the operator
+ *  exactly which runs were cleaned. Idempotent: a second call on the
+ *  same DB state finds nothing. */
+export async function sweepStalePhantomRunningRuns(
+  maxHours = DEFAULT_RUNNING_STALE_HOURS,
+): Promise<StalePhantomRunningResult> {
+  try {
+    const cutoff = new Date(Date.now() - maxHours * 60 * 60 * 1000);
+    const rows = await getDb()
+      .update(schema.oceanBotRun)
+      .set({
+        status: "failed",
+        endedAt: new Date(),
+        blocker: sql`COALESCE(${schema.oceanBotRun.blocker}, ${`auto-cleanup: phantom running row >${maxHours}h, no terminal event recorded`})`,
+      })
+      .where(
+        and(
+          eq(schema.oceanBotRun.status, "running"),
+          sql`${schema.oceanBotRun.startedAt} < ${cutoff}`,
+        ),
+      )
+      .returning({ id: schema.oceanBotRun.id });
+    const fixedIds = rows.map((r) => r.id);
+    if (fixedIds.length > 0) {
+      log.warn("health_sweep.stale_phantom_running_fixed", {
+        count: fixedIds.length,
+        ids: fixedIds,
+        maxHours,
+      });
+    }
+    return { fixedCount: fixedIds.length, fixedIds };
+  } catch (e) {
+    log.error("health_sweep.sweepStalePhantomRunningRuns failed", {
       err: errMsg(e),
     });
     return { fixedCount: 0, fixedIds: [] };
@@ -403,6 +469,7 @@ export async function exportOperatorActionQueue(
 export async function runHealthSweep(): Promise<HealthSweepState> {
   const ranAt = new Date().toISOString();
   const stale = await sweepStaleOpenBacklogItems();
+  const stalePhantomRunning = await sweepStalePhantomRunningRuns();
   const stuckNoop = await findStuckNoopTasks();
   const stuckPreflight = await findStuckPreflightFails();
   const staleApproved = await findStaleApprovedRuns();
@@ -412,6 +479,7 @@ export async function runHealthSweep(): Promise<HealthSweepState> {
     stuckNoop,
     stuckPreflight,
     staleApproved,
+    stalePhantomRunning,
   };
   await setState(HEALTH_SWEEP_STATE_KEY, state);
   // Mirror the blocked-operator-action items out to disk so the
@@ -421,6 +489,7 @@ export async function runHealthSweep(): Promise<HealthSweepState> {
   const opQueue = await exportOperatorActionQueue();
   log.info("health_sweep.complete", {
     fixedStaleOpen: stale.fixedCount,
+    fixedStalePhantomRunning: stalePhantomRunning.fixedCount,
     stuckNoopGroups: stuckNoop.length,
     stuckPreflightGroups: stuckPreflight.length,
     staleApprovedGroups: staleApproved.length,

@@ -48,6 +48,44 @@ export interface ScoutResolution {
    *  acceptance criteria). When unset or empty, the main run uses the
    *  original description. */
   clarifiedScope?: string;
+  /** When verdict='proceed' AND the warnings reveal a concrete pass/fail
+   *  check (`npm test` exits 0, audit verify passes, specific file emits
+   *  expected output), the resolver writes the criterion here. The runner
+   *  then spawns `claude -p "/goal <criteria> or stop after <N> turns\n\n<prompt>"`
+   *  instead of the plain prompt, so Anthropic's per-turn evaluator
+   *  catches "shipped a half-done task" misses on uncertain runs. Skip
+   *  for routine clarifications, the cost of an extra evaluator-Haiku
+   *  call per turn isn't worth it. */
+  acceptanceCriteria?: string;
+}
+
+/** Turn cap baked into the /goal condition for scout-uncertain runs.
+ *  Anthropic docs note achieved/cleared goals don't restore on
+ *  --resume, but active goals carry over with counters reset, so the
+ *  bot's 24h resume window doesn't fight this. 5 turns is empirically
+ *  the right balance: small fixes finish in 2-3 turns, but legitimate
+ *  multi-file work needs a bit of headroom. The cap composes with the
+ *  process-level timeout, output-token cap, and tool-use cap. */
+export const DEFAULT_GOAL_TURN_CAP = 5;
+
+/** Pure: when resolution.verdict === 'proceed' AND acceptanceCriteria is set,
+ *  return a /goal-wrapped prompt with the turn cap baked into the
+ *  condition itself (per Anthropic docs, the turn cap is a Claude-internal
+ *  stop expressed inside the /goal text). Otherwise return the input
+ *  prompt unchanged.
+ *
+ *  Composition order matters: this MUST run AFTER any clarifiedScope
+ *  rewrite of the task description, the resolver rewrites the task body
+ *  (inside the /goal envelope) and the wrapper sits outside.
+ */
+export function applyGoalWrapper(
+  prompt: string,
+  resolution: ScoutResolution,
+  turnCap: number = DEFAULT_GOAL_TURN_CAP,
+): string {
+  if (resolution.verdict !== "proceed") return prompt;
+  if (!resolution.acceptanceCriteria) return prompt;
+  return `/goal ${resolution.acceptanceCriteria} or stop after ${turnCap} turns\n\n${prompt}`;
 }
 
 export interface ResolverOutcome {
@@ -134,6 +172,18 @@ export function parseResolverResponse(text: string): ScoutResolution | null {
     if (typeof clarifiedScope === "string" && clarifiedScope.trim() !== "") {
       out.clarifiedScope = clarifiedScope.trim();
     }
+    const acceptanceCriteria = obj["acceptanceCriteria"];
+    // acceptanceCriteria only makes sense on proceed verdicts. The
+    // prompt instructs the model to omit it otherwise, but be defensive:
+    // a skip/escalate/block with stray criteria would just confuse the
+    // dashboard's gate event.
+    if (
+      verdict === "proceed" &&
+      typeof acceptanceCriteria === "string" &&
+      acceptanceCriteria.trim() !== ""
+    ) {
+      out.acceptanceCriteria = acceptanceCriteria.trim();
+    }
     return out;
   }
   return null;
@@ -153,7 +203,8 @@ export function buildResolverPrompt(
     "Output JSON shape (exact keys):",
     '{ "verdict": "proceed" | "skip" | "escalate" | "block",',
     '  "explanation": "<one short sentence>",',
-    '  "clarifiedScope": "<optional rewritten task description, only if verdict=\\"proceed\\" AND clarification helps>"',
+    '  "clarifiedScope": "<optional rewritten task description, only if verdict=\\"proceed\\" AND clarification helps>",',
+    '  "acceptanceCriteria": "<optional concrete pass/fail check, only if verdict=\\"proceed\\" AND a measurable success condition is obvious>"',
     "}",
     "",
     "Decision rubric (apply in order):",
@@ -208,6 +259,38 @@ export function buildResolverPrompt(
     "hook edge case for v1'), write a tightened task description in",
     "clarifiedScope. The bot's main run will use this instead of the",
     "original. Leave clarifiedScope unset if no rewrite is needed.",
+    "",
+    "ACCEPTANCE CRITERIA rubric (acceptanceCriteria field):",
+    "",
+    "  Emit acceptanceCriteria ONLY when ALL of the following hold:",
+    "    a. verdict === 'proceed' (skip / escalate / block never set it).",
+    "    b. The warnings or task description reveal a CONCRETE PASS/FAIL",
+    "       check the bot can verify autonomously after each turn (e.g.,",
+    "       'npm test exits 0', 'audit verify --require-signed passes',",
+    "       'the new test file exists and asserts X', 'the regex no longer",
+    "       hangs on input <fixture>'). The check must be observable from",
+    "       command output or file state, not a subjective judgment.",
+    "    c. The risk reads as 'might ship a half-done task' rather than",
+    "       'might pick the wrong file'. Per-turn evaluation catches the",
+    "       former; clarifiedScope alone catches the latter.",
+    "",
+    "  When set, the bot wraps the main prompt with",
+    "    /goal <criteria> or stop after 5 turns",
+    "  so Anthropic's per-turn evaluator (Haiku) judges progress between",
+    "  turns. The 5-turn cap is a Claude-internal stop, you don't need to",
+    "  add a separate turn limit.",
+    "",
+    "  SKIP acceptanceCriteria for routine clarifications: framework",
+    "  convention questions, file-scope narrowing (clarifiedScope already",
+    "  handles those), trivial fixes that finish in one turn. The",
+    "  evaluator adds ~168 Haiku tokens per turn; only worth paying when",
+    "  the bot is genuinely uncertain whether it will finish the task.",
+    "",
+    "  Phrase the criterion as ONE sentence stating the success condition",
+    "  affirmatively (what must be true), not as a checklist or list of",
+    "  steps. Example: 'Validator emits no em-dash false-positive on the",
+    "  fixture in src/core/feedback/examples-emdash.test.ts and the full",
+    "  suite passes.' NOT a multi-item checklist.",
     "",
     "Bot capabilities (relevant when deciding proceed vs escalate):",
     "  The bot CAN run these from a shell without operator help:",

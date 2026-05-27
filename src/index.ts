@@ -59,6 +59,9 @@ import {
   activeTaskIds,
   recentlyNoopTaskIds,
   markBacklogItemDone,
+  listOpenBacklogIds,
+  findReferencedBacklogIds,
+  closeBacklogItemsByIds,
   blockBacklogItemForOperatorAction,
   countOrphanFailuresForTaskId,
   blockBacklogItemForOrphanRetries,
@@ -86,6 +89,8 @@ import { scoutTask, SCOUT_DESCRIPTION_THRESHOLD } from "./scout.js";
 import {
   resolveScoutScope,
   fallbackOnFailure,
+  applyGoalWrapper,
+  DEFAULT_GOAL_TURN_CAP,
   type ScoutResolution,
 } from "./scout-resolver.js";
 import { ulid } from "./util/ulid.js";
@@ -97,6 +102,7 @@ import {
   diffSinceCommit,
   fileLastModified,
   commitReachable,
+  commitMessage,
 } from "./util/git.js";
 import { closeDb } from "./db/index.js";
 
@@ -539,6 +545,64 @@ async function tick(
   }
 }
 
+/**
+ * Receive-side auto-close for the stale-open backlog class.
+ *
+ * Reads the commit message, fetches currently-open backlog ids for the
+ * adapter's project, finds any whose id appears as a whole token in the
+ * message (kebab-case-id-safe match), and closes them with audit metadata
+ * pointing at the commit + runId. Skips the run's own taskId because the
+ * caller has already invoked `markBacklogItemDone`.
+ *
+ * All operations are best-effort: a git or db failure logs + falls
+ * through so the ship path still succeeds. Worst case: we miss closing
+ * a referenced item, which the operator can do manually -- strictly
+ * better than the pre-fix state (NEVER auto-closed for non-backlog
+ * queue ships).
+ *
+ * Called from both ship paths: auto-push (executeRun) and approved-
+ * shipped (pushApprovedRuns). Bit dotnet-* 2026-05-22 -> 2026-05-26.
+ */
+async function autoCloseReferencedBacklogItems(
+  adapter: ProjectAdapter,
+  runId: string,
+  commitSha: string,
+  ownTaskId: string | undefined | null,
+): Promise<void> {
+  try {
+    const message = await commitMessage(adapter.rootDir, commitSha);
+    if (!message) return;
+    const openIds = await listOpenBacklogIds(adapter.name);
+    if (openIds.length === 0) return;
+    const referenced = findReferencedBacklogIds(message, openIds);
+    if (referenced.length === 0) return;
+    const ownId =
+      ownTaskId && ownTaskId.startsWith("backlog:")
+        ? ownTaskId.slice("backlog:".length)
+        : null;
+    const toClose = ownId
+      ? referenced.filter((id) => id !== ownId)
+      : referenced;
+    if (toClose.length === 0) return;
+    await closeBacklogItemsByIds(
+      toClose,
+      commitSha,
+      runId,
+      "auto-closed: commit message references backlog item id",
+    );
+    log.info("tick.run.shipped.auto_closed_backlog_refs", {
+      runId,
+      closedIds: toClose,
+      commitSha,
+    });
+  } catch (e) {
+    log.error("tick.run.shipped.auto_close_failed", {
+      runId,
+      err: e instanceof Error ? e.message : String(e),
+    });
+  }
+}
+
 async function executeRun(
   cfg: BotConfig,
   adapter: ProjectAdapter,
@@ -679,6 +743,7 @@ async function executeRun(
         verdict: resolution.verdict,
         explanation: resolution.explanation,
         clarifiedScope: resolution.clarifiedScope ?? null,
+        acceptanceCriteria: resolution.acceptanceCriteria ?? null,
         failure: resolverOutcome.failure,
         cached: resolverOutcome.cached,
       });
@@ -759,6 +824,30 @@ async function executeRun(
           clarifiedLen: resolution.clarifiedScope.length,
         });
         pick.summary = resolution.clarifiedScope;
+      }
+      // /goal wrapper. When the resolver emitted acceptanceCriteria,
+      // wrap the (possibly clarified) prompt with a /goal envelope so
+      // Anthropic's per-turn Haiku evaluator judges progress between
+      // turns. The 5-turn cap is baked INTO the condition itself per
+      // Anthropic docs, not a separate CLI flag. Composes with the
+      // process-level timeout, output-token cap, tool-use cap, and
+      // rate-limit gate already in place. Skipped for routine
+      // clarifications (the resolver omits acceptanceCriteria there)
+      // so the evaluator's ~168 Haiku tokens per turn is paid only on
+      // scout-uncertain runs.
+      if (resolution.acceptanceCriteria) {
+        const wrapped = applyGoalWrapper(pick.summary, resolution);
+        await appendEvent(runId, "gate", {
+          kind: "goal_set",
+          acceptanceCriteria: resolution.acceptanceCriteria,
+          turnCap: DEFAULT_GOAL_TURN_CAP,
+        });
+        log.info("tick.run.scout_resolver.goal_set", {
+          runId,
+          turnCap: DEFAULT_GOAL_TURN_CAP,
+          criteriaLen: resolution.acceptanceCriteria.length,
+        });
+        pick.summary = wrapped;
       }
     }
   }
@@ -1000,6 +1089,20 @@ async function executeRun(
     // ItemDone no-ops when taskId is null / missing / not prefixed
     // 'backlog:' (creative / refactor / tightening picks all skip).
     await markBacklogItemDone(pick.taskId);
+    // Receive-side defense for the stale-open class. If this commit's
+    // message names any OPEN backlog item id (creative / refactor
+    // ships often satisfy a backlog item incidentally), auto-close
+    // those too. Skips the pick's own id (markBacklogItemDone handled
+    // it). Bit dotnet-* 2026-05-22 -> 2026-05-26 when the C# parser
+    // shipped via creative queue and 4 dotnet-* backlog items rotted
+    // open for 4 days. See memory/feedback_auth_trust_host_required.md
+    // (4th lesson) + journal.ts#closeBacklogItemsByIds.
+    await autoCloseReferencedBacklogItems(
+      adapter,
+      runId,
+      headAfter,
+      pick.taskId,
+    );
     log.info("tick.run.shipped", { runId, sha: headAfter, taskId: pick.taskId });
   } else {
     await setRunFields(runId, {
@@ -1088,8 +1191,20 @@ async function pushApprovedRuns(adapter: ProjectAdapter): Promise<void> {
       // `backlog:` prefix). Without this, the adapter's `status='open'`
       // filter never removes the item, bot ships the same fix every
       // tick until manual intervention. Surfaced on 2026-05-12 when
-      // webhook-dedupe shipped 3× in 9min.
+      // webhook-dedupe shipped 3x in 9min.
       await markBacklogItemDone(taskId);
+      // Receive-side defense (same as the auto-push path): if the
+      // commit's message references any other open backlog item id,
+      // close it too. Commit sha already in run.commitSha.
+      const shippedSha = run.commitSha;
+      if (shippedSha) {
+        await autoCloseReferencedBacklogItems(
+          adapter,
+          run.id,
+          shippedSha,
+          taskId,
+        );
+      }
       log.info("approved.shipped", { runId: run.id, taskId });
       // Layer 3 of stale-prevention: if the just-pushed commit touches
       // any bot-affecting path, the running JS is now stale (drift gate

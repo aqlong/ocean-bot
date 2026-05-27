@@ -7,7 +7,7 @@ import {
   type HealthSweepStuckGroup,
 } from "@/lib/queries";
 import { driftSnapshot, type DriftSnapshot } from "@/lib/health-queries";
-import { LocalTime } from "../approvals/local-time";
+import { LocalTime } from "../../src/components/local-time";
 import { ProjectChip } from "@/components/ProjectChip";
 import { AutoRefreshIndicator } from "@/components/AutoRefreshIndicator";
 
@@ -156,7 +156,7 @@ function HealthSweepSection({
         flags loops + stuck approvals for operator review. green = nothing
         operator-actionable.
       </p>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Metric
           label="stale-open auto-fixed (last sweep)"
           value={sweep.fixedStaleOpen}
@@ -165,6 +165,16 @@ function HealthSweepSection({
             sweep.fixedStaleOpen === 0
               ? "no shipped-but-open backlog items found. target: 0."
               : `closed: ${sweep.fixedStaleOpenIds.slice(0, 3).join(", ")}${sweep.fixedStaleOpenIds.length > 3 ? "…" : ""}`
+          }
+        />
+        <Metric
+          label="phantom 'running' auto-failed (>24h)"
+          value={sweep.fixedStalePhantomRunning}
+          tone={sweep.fixedStalePhantomRunning === 0 ? "good" : "warn"}
+          hint={
+            sweep.fixedStalePhantomRunning === 0
+              ? "no runs sat past the 24h stale-running window. target: 0."
+              : `flipped: ${sweep.fixedStalePhantomRunningIds.slice(0, 3).join(", ")}${sweep.fixedStalePhantomRunningIds.length > 3 ? "…" : ""}`
           }
         />
         <Metric

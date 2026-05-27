@@ -15,6 +15,7 @@ import {
   type BacklogSortOrder,
 } from "@/lib/backlog-ops";
 import { BacklogTable } from "./BacklogTable";
+import { BacklogCardList } from "./BacklogCardList";
 import { AddItemForm } from "./AddItemForm";
 import { KNOWN_PROJECTS } from "@/lib/projects";
 import { Pagination } from "@/components/Pagination";
@@ -175,11 +176,13 @@ export default async function BacklogPage({
             kept getting rebased away). Inspect the item, then reopen it or
             archive it.
           </p>
-          <BacklogTable items={blocked.items} />
+          <div className="sm:hidden"><BacklogCardList items={blocked.items} query={filter.q} /></div>
+          <div className="hidden sm:block"><BacklogTable items={blocked.items} query={filter.q} /></div>
         </section>
       )}
 
-      <BacklogTable items={items} />
+      <div className="sm:hidden"><BacklogCardList items={items} query={filter.q} /></div>
+      <div className="hidden sm:block"><BacklogTable items={items} query={filter.q} /></div>
 
       {items.length === 0 && total === 0 && (
         <div className="rounded border border-line bg-panel p-6 text-center text-sm text-dim">

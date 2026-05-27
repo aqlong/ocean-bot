@@ -16,7 +16,7 @@ import {
   applyOutOfBandShipped,
 } from "@/lib/reclassify";
 import { cx } from "@/lib/cx";
-import { LocalTime } from "./approvals/local-time";
+import { LocalTime } from "../src/components/local-time";
 import { InFlightCard } from "@/components/InFlightCard";
 import { ProjectChip } from "@/components/ProjectChip";
 import { RunRow } from "@/components/RunRow";

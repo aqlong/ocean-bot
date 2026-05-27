@@ -15,8 +15,9 @@ import {
 } from "@/lib/backlog-types";
 import { KNOWN_PROJECTS } from "@/lib/projects";
 import { cx } from "@/lib/cx";
-import { LocalTime } from "../approvals/local-time";
+import { LocalTime } from "../../src/components/local-time";
 import { ProjectChip } from "@/components/ProjectChip";
+import { highlightMatches } from "@/lib/highlight";
 
 interface Row {
   id: string;
@@ -59,7 +60,7 @@ const SEVERITY_COLOR: Record<string, string> = {
   unspecified: "bg-panel text-dim border-line",
 };
 
-export function BacklogTable({ items }: { items: Row[] }) {
+export function BacklogTable({ items, query = "" }: { items: Row[]; query?: string }) {
   // Local ordering buffer, drag/arrow updates this immediately for snappy
   // UX, then a server action persists asynchronously.
   const [rows, setRows] = useState(items);
@@ -156,14 +157,14 @@ export function BacklogTable({ items }: { items: Row[] }) {
               ▼
             </button>
           </div>
-          <ItemBody row={row} />
+          <ItemBody row={row} query={query} />
         </li>
       ))}
     </ul>
   );
 }
 
-function ItemBody({ row }: { row: Row }) {
+function ItemBody({ row, query = "" }: { row: Row; query?: string }) {
   const [editing, setEditing] = useState(false);
 
   if (editing) {
@@ -281,7 +282,7 @@ function ItemBody({ row }: { row: Row }) {
           ~200-char single-paragraph titles); min-w-0 on the parent +
           break-words here lets the row body shrink inside flex
           instead of forcing horizontal scroll. */}
-      <div className="break-words text-ink">{row.title}</div>
+      <div className="break-words text-ink">{highlightMatches(row.title, query)}</div>
       {row.description && (
         <details className="group">
           <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden">
@@ -291,7 +292,7 @@ function ItemBody({ row }: { row: Row }) {
                 because they live outside this <details>. */}
             <div className="flex items-baseline gap-2">
               <span className="line-clamp-1 break-words text-[11px] text-dim">
-                {firstLine(row.description)}
+                {highlightMatches(firstLine(row.description), query)}
               </span>
               <span className="select-none whitespace-nowrap text-[10px] text-dim group-open:hidden">
                 show more ▸
@@ -302,7 +303,7 @@ function ItemBody({ row }: { row: Row }) {
             </div>
           </summary>
           <div className="mt-1 whitespace-pre-wrap break-words rounded bg-bg/40 p-2 text-[11px] text-dim">
-            {row.description}
+            {highlightMatches(row.description, query)}
           </div>
         </details>
       )}

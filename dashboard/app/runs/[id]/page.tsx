@@ -3,6 +3,8 @@ import { runById, eventsForRun } from "@/lib/queries";
 import { annotateFailedRuns } from "@/lib/reclassify";
 import { cx } from "@/lib/cx";
 import { ProjectChip } from "@/components/ProjectChip";
+import { LocalTime } from "@/components/local-time";
+import { formatDuration, durationTone } from "@/lib/format-time";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 5;
@@ -42,6 +44,10 @@ export default async function RunDetail({
           {run.pushState && <span>· push: {run.pushState}</span>}
         </div>
         <RunConfig metadata={run.metadata} />
+        <RunTiming
+          startedAt={run.startedAt}
+          endedAt={run.endedAt}
+        />
         {run.blocker && (
           <div className="mt-2 break-words rounded bg-warn/10 p-2 text-xs text-warn">
             {run.blocker}
@@ -116,16 +122,54 @@ function StatusTag({
   return <span className={cx("font-bold", color)}>{status}</span>;
 }
 
+function RunTiming({
+  startedAt,
+  endedAt,
+}: {
+  startedAt: Date;
+  endedAt: Date | null;
+}) {
+  const duration = endedAt
+    ? new Date(endedAt).getTime() - new Date(startedAt).getTime()
+    : new Date().getTime() - new Date(startedAt).getTime();
+  const isInFlight = !endedAt;
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-xs text-dim">
+      <span>
+        started:{" "}
+        <LocalTime iso={new Date(startedAt).toISOString()} format="compact-with-relative" />
+      </span>
+      {endedAt && (
+        <span>
+          · ended:{" "}
+          <LocalTime iso={new Date(endedAt).toISOString()} format="compact-with-relative" />
+        </span>
+      )}
+      <span className={cx("font-medium", durationTone(duration))}>
+        · {formatDuration(duration)}
+      </span>
+      {isInFlight && (
+        <span className="flex items-center gap-1">
+          · <span className="h-1.5 w-1.5 rounded-full bg-accent animate-pulse" />
+          <span>in-flight</span>
+        </span>
+      )}
+    </div>
+  );
+}
+
 function EventRow({
   event,
 }: {
   event: { id: number; ts: Date; type: string; payload: unknown };
 }) {
-  const time = new Date(event.ts).toLocaleTimeString();
   return (
     <details className="rounded border border-line bg-panel p-2 text-xs">
       <summary className="cursor-pointer break-words text-ink">
-        <span className="mr-2 text-dim">{time}</span>
+        <span className="mr-2 text-dim">
+          <LocalTime iso={event.ts.toISOString()} format="compact" />
+        </span>
         <span className="text-accent">{event.type}</span>
         <span className="ml-2 text-dim">{summarize(event.payload)}</span>
       </summary>

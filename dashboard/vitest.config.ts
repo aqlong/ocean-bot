@@ -6,7 +6,7 @@ export default defineConfig({
     globals: false,
     environment: "node",
     include: ["src/**/*.test.ts", "app/**/*.test.ts"],
-    exclude: ["node_modules", ".next"],
+    exclude: ["**/node_modules/**", ".next"],
     // Some test files write to a shared Postgres test DB (queries +
     // approval-ops integration tests). Running them in parallel makes
     // TRUNCATE-based fixtures collide. Force serial file execution.

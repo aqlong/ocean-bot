@@ -255,7 +255,7 @@ export class Code2wikiAdapter implements ProjectAdapter {
     //
     // Multiline mode (`m`) anchors ^ to start of each line in the body.
     const gapMarkers =
-      /^[\s\-*•]*(Did NOT verify|Did NOT|Skipped|Memory-only|Deferred|Gaps):\s*(.+?)\s*$/gim;
+      /^[\s\-*•]*(Did NOT verify|Did NOT|Skipped|Memory-only|Deferred|Gaps):\s*(.+)$/gim;
     for (const c of recent) {
       // Ownership filter: commits whose entire file set lives under
       // tools/ocean-bot/ belong to the ocean-bot adapter; skip them so

@@ -1,9 +1,6 @@
 import Link from "next/link";
 import { cx } from "@/lib/cx";
-// LocalTime lives in app/approvals/ (not under src/); the relative path
-// crosses the src/→app/ boundary. Moving it to src/components/ is out of
-// scope here; the ../../ path resolves correctly under Next.js bundler.
-import { LocalTime } from "../../app/approvals/local-time";
+import { LocalTime } from "./local-time";
 import { ProjectChip } from "@/components/ProjectChip";
 import { computeRunRowDisplay } from "./run-row-display";
 

@@ -10,6 +10,8 @@ import {
   loadBotSessions,
   appendBotSession,
   resolveCaps,
+  computeDimensionResets,
+  estimateGoalOverhead,
   DEFAULT_CAPS,
   MAX_20X_REFERENCE,
   type BudgetCaps,
@@ -490,6 +492,71 @@ describe("decideProjectBudgets", () => {
     expect(c2w.worstRatio).toBeLessThan(1.0);
   });
 
+  it("applies /goal evaluator output overhead to ratio math (parity with decideBudget)", () => {
+    // The f6d6035 fix added GOAL_EVALUATOR_OUTPUT_OVERHEAD to ratio math in
+    // decideBudget so a low-output session is recognised as /goal-driven
+    // and counted realistically. Per-project gates share the same input
+    // (output tokens come from the same stream-json) so the parity is
+    // load-bearing — without it a project's sub-cap would silently
+    // undercount evaluator usage by 168 tokens per /goal turn.
+    //
+    // tightCaps below set fiveHrOutput=300, with share=0.5 the sub-cap
+    // is 150. Raw output 50 → 50/150 = 0.33 (ok). With +168 evaluator
+    // overhead → 218/150 = 1.45 → stop. A regression that dropped the
+    // overhead from this function would silently flip the gate back to
+    // "ok" and let the project burn evaluator turns past its sub-cap.
+    const tightCaps: BudgetCaps = {
+      fiveHrInput: 1_000_000,
+      fiveHrOutput: 300,
+      sevenDInput: 7_000_000,
+      sevenDOutput: 2_100,
+      warnRatio: 0.9,
+      perProject: { "code2wiki": { share: 0.5 } },
+    };
+    const rows = [
+      row({
+        inputTokens: 100,
+        outputTokens: 50, // < 500 → estimateGoalOverhead returns 168
+        sessionPath: "/tmp/c2w-goal.jsonl",
+      }),
+    ];
+    const out = decideProjectBudgets({
+      rowsByProject: new Map([["code2wiki", rows]]),
+      caps: tightCaps,
+      now: NOW,
+    });
+    const c2w = out.get("code2wiki")!;
+    expect(c2w.gate).toBe("stop");
+    expect(c2w.worstRatio).toBeGreaterThan(1.0);
+    // Displayed totals stay unmodified — overhead is ratio-only.
+    expect(c2w.fiveHr.outputTokens).toBe(50);
+    expect(c2w.sevenD.outputTokens).toBe(50);
+  });
+
+  it("does not add overhead when output is above the /goal threshold", () => {
+    // estimateGoalOverhead returns 0 when output >= 500, so per-project
+    // ratio math behaves identically to the pre-fix path for non-/goal
+    // sessions. Defends against an accidental "always add 168" refactor.
+    const rows = [
+      row({
+        inputTokens: 1000,
+        outputTokens: 600, // above the 500 threshold → no overhead
+        sessionPath: "/tmp/c2w-normal.jsonl",
+      }),
+    ];
+    const out = decideProjectBudgets({
+      rowsByProject: new Map([["code2wiki", rows]]),
+      caps: projectCaps,
+      now: NOW,
+    });
+    const c2w = out.get("code2wiki")!;
+    // fiveHrOutput sub-cap = 1200; 600 / 1200 = 0.5 → ok.
+    expect(c2w.gate).toBe("ok");
+    expect(c2w.fiveHr.outputTokens).toBe(600);
+    // Worst ratio reflects the unadjusted 600, not 768.
+    expect(c2w.worstRatio).toBeCloseTo(0.5, 3);
+  });
+
   it("overlapping 0.6 + 0.6 shares are independent: one project at cap does not block the other", () => {
     // Load-bearing test for the design intent: shares are not a
     // mutually exclusive partition. code2wiki at its sub-cap (stop)
@@ -508,5 +575,140 @@ describe("decideProjectBudgets", () => {
     expect(out.get("code2wiki")?.gate).toBe("stop");
     expect(out.get("ocean-bot")?.gate).toBe("ok");
     expect(out.get("ocean-bot")?.worstRatio).toBe(0);
+  });
+});
+
+describe("computeDimensionResets", () => {
+  const FIVE_HR_MS = 5 * 60 * 60 * 1000;
+  const SEVEN_D_MS = 7 * 24 * 60 * 60 * 1000;
+
+  it("uses anchor + 5hr for 5hr reset when anchor is set", () => {
+    const anchor = NOW - 60 * 60 * 1000; // 1 hour ago
+    const result = computeDimensionResets({
+      rows: [row()],
+      botSessionPaths: botPaths,
+      now: NOW,
+      fiveHrWindowStart: anchor,
+    });
+    expect(result.fiveHrInput).toBe(anchor + FIVE_HR_MS);
+    expect(result.fiveHrOutput).toBe(anchor + FIVE_HR_MS);
+  });
+
+  it("uses oldest 5hr row + 5hr when anchor is not set", () => {
+    const oldestTime = NOW - 30 * 60 * 1000; // 30 min ago
+    const result = computeDimensionResets({
+      rows: [row({ ts: oldestTime })],
+      botSessionPaths: botPaths,
+      now: NOW,
+    });
+    expect(result.fiveHrInput).toBe(oldestTime + FIVE_HR_MS);
+    expect(result.fiveHrOutput).toBe(oldestTime + FIVE_HR_MS);
+  });
+
+  it("uses oldest 7d row + 7d for 7d reset", () => {
+    const oldestTime = NOW - 2 * 24 * 60 * 60 * 1000; // 2 days ago
+    const result = computeDimensionResets({
+      rows: [row({ ts: oldestTime })],
+      botSessionPaths: botPaths,
+      now: NOW,
+    });
+    expect(result.sevenDInput).toBe(oldestTime + SEVEN_D_MS);
+    expect(result.sevenDOutput).toBe(oldestTime + SEVEN_D_MS);
+  });
+
+  it("returns now for both resets when no rows in either window", () => {
+    const result = computeDimensionResets({
+      rows: [],
+      botSessionPaths: botPaths,
+      now: NOW,
+    });
+    expect(result.fiveHrInput).toBe(NOW);
+    expect(result.fiveHrOutput).toBe(NOW);
+    expect(result.sevenDInput).toBe(NOW);
+    expect(result.sevenDOutput).toBe(NOW);
+  });
+
+  it("filters by bot session paths", () => {
+    const botRow = row({ ts: NOW - 60 * 60 * 1000 });
+    const nonBotRow = row({
+      ts: NOW - 60 * 60 * 1000,
+      sessionPath: "/tmp/interactive.jsonl",
+    });
+    const result = computeDimensionResets({
+      rows: [botRow, nonBotRow],
+      botSessionPaths: botPaths, // only includes /tmp/session-a.jsonl
+      now: NOW,
+    });
+    // Should use botRow's timestamp, not nonBotRow's
+    expect(result.fiveHrInput).toBe(botRow.ts + FIVE_HR_MS);
+  });
+});
+
+describe("estimateGoalOverhead, /goal evaluator token accounting", () => {
+  it("returns zero overhead for normal (non-goal) output", () => {
+    // Output > 500 tokens suggests no /goal (evaluator overhead would be visible in stream if it mattered).
+    expect(estimateGoalOverhead(600)).toBe(0);
+    expect(estimateGoalOverhead(1000)).toBe(0);
+  });
+
+  it("returns 1-turn overhead for low-output sessions (likely /goal)", () => {
+    // Output < 500 and > 0 suggests /goal was used (evaluator cost missing from stream).
+    expect(estimateGoalOverhead(100)).toBe(168);
+    expect(estimateGoalOverhead(250)).toBe(168);
+    expect(estimateGoalOverhead(1)).toBe(168);
+  });
+
+  it("returns zero for zero output", () => {
+    expect(estimateGoalOverhead(0)).toBe(0);
+  });
+
+  it("pins the 499 / 500 boundary on the < 500 threshold", () => {
+    // budget.ts:175 hardcodes `outputTokens < 500` (strict). 499 must be
+    // inside the band (returns 168); 500 must be outside (returns 0).
+    // Pinning both ends defends two distinct off-by-one mutations:
+    //   `< 500` -> `<= 500` would flip 500 from 0 to 168.
+    //   `< 500` -> `< 499` would flip 499 from 168 to 0.
+    expect(estimateGoalOverhead(499)).toBe(168);
+    expect(estimateGoalOverhead(500)).toBe(0);
+  });
+
+  it("adjusts ratios when goal overhead is added to decideBudget", () => {
+    // Create a row that looks like a /goal session: low output, reasonable input.
+    const goalRow = row({
+      inputTokens: 5000,
+      outputTokens: 100, // Low output -> goal overhead triggered
+    });
+    const d = decideBudget({
+      rows: [goalRow],
+      botSessionPaths: botPaths,
+      caps,
+      now: NOW,
+    });
+    // Output ratio should account for overhead: (100 + 168) / 2000 = 0.134
+    // vs non-goal: 100 / 2000 = 0.05
+    // This should push it past the warn threshold (0.9) if output cap is tight.
+    // With default cap of 500k, even 268 tokens is 0.05%, so let's test the gate instead.
+    const worstRatio = d.worstRatio;
+    // The output ratio with overhead is 0.536 (268 / 500k), so worst should reflect it.
+    expect(d.sevenD.outputTokens).toBe(100); // Original value unchanged
+    // But the ratio calculation used the overhead, so worst ratio should be higher than 100/500k.
+    expect(worstRatio).toBeGreaterThan(100 / caps.sevenDOutput);
+  });
+
+  it("avoids double-counting: real /goal output in stream doesn't trigger overhead", () => {
+    // If a session HAD real output from /goal (visible in stream, > 500 tokens),
+    // overhead is not added (already counted). When output >= 500, estimateGoalOverhead
+    // returns 0 and decideBudget uses the actual token counts without adjustment.
+    const d = decideBudget({
+      rows: [row({ outputTokens: 600 })],
+      botSessionPaths: botPaths,
+      caps,
+      now: NOW,
+    });
+    // Core check: fiveHr and sevenD output are exactly 600, not 600+168.
+    expect(d.fiveHr.outputTokens).toBe(600);
+    expect(d.sevenD.outputTokens).toBe(600);
+    // And the overhead function itself returns 0 for this value
+    expect(estimateGoalOverhead(600)).toBe(0);
   });
 });

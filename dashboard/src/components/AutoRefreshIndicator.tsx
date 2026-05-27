@@ -1,4 +1,4 @@
-import { LocalTime } from "../../app/approvals/local-time";
+import { LocalTime } from "./local-time";
 
 /**
  * Server component that renders a "updates every Ns · last: HH:MM:SS"

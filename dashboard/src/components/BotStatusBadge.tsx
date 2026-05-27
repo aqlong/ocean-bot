@@ -1,6 +1,6 @@
 import { Suspense } from "react";
 import { fetchBotStatus, badgeProps } from "@/lib/bot-status";
-import { LocalTime } from "../../app/approvals/local-time";
+import { LocalTime } from "./local-time";
 import { cx } from "@/lib/cx";
 
 async function BadgeInner() {

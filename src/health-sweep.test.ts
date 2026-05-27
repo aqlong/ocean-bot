@@ -48,7 +48,7 @@ async function seedBacklog(
 async function seedRun(args: {
   id: string;
   project?: string;
-  status: "shipped" | "failed" | "approved";
+  status: "shipped" | "failed" | "approved" | "running";
   taskId?: string | null;
   commitSha?: string | null;
   blocker?: string | null;
@@ -132,30 +132,32 @@ D("health-sweep.sweepStaleOpenBacklogItems", () => {
   });
 
   it("scopes the join to the run's project (cross-project safety)", async () => {
-    // Item with the same id exists under both projects (defensive).
-    // A shipped run in project=ocean-bot must NOT close the code2wiki
-    // sibling.
-    await seedBacklog("same-id", "open", "code2wiki");
-    await seedBacklog("same-id", "open", "ocean-bot");
+    // The sweep joins on r.project = b.project; a shipped run in
+    // project=ocean-bot referencing backlog:scoped-item must NOT close
+    // the code2wiki item with that id. (Backlog ids are globally unique
+    // per the schema PK, so the original same-id-under-two-projects
+    // scenario can't occur; we exercise the project-scope clause by
+    // mismatching the run's project against the only item's project.)
+    await seedBacklog("scoped-item", "open", "code2wiki");
     await seedRun({
       id: "RUN_D",
       project: "ocean-bot",
       status: "shipped",
-      taskId: "backlog:same-id",
+      taskId: "backlog:scoped-item",
       commitSha: "11ee22",
     });
 
     const r = await sweep.sweepStaleOpenBacklogItems();
-    expect(r.fixedCount).toBe(1);
-    expect(r.fixedIds).toEqual(["same-id"]);
-    // The code2wiki sibling stays open.
+    expect(r.fixedCount).toBe(0);
+    // The code2wiki item stays open, the cross-project run did not
+    // close it.
     const { Client } = await import("pg");
     const c = new Client({ connectionString: TEST_URL });
     await c.connect();
     try {
       const { rows } = await c.query(
         "SELECT status FROM ocean_bot_backlog_item WHERE id=$1 AND project=$2",
-        ["same-id", "code2wiki"],
+        ["scoped-item", "code2wiki"],
       );
       expect(rows[0]?.status).toBe("open");
     } finally {
@@ -377,6 +379,140 @@ D("health-sweep.findStuckPreflightFails", () => {
   });
 });
 
+D("health-sweep.sweepStalePhantomRunningRuns", () => {
+  beforeEach(truncate);
+
+  it("flips a 'running' row started >24h ago to 'failed' with the auto-cleanup blocker", async () => {
+    await seedRun({
+      id: "RUN_PHANTOM_OLD",
+      status: "running",
+      taskId: "backlog:phantom-old",
+      startedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
+
+    const r = await sweep.sweepStalePhantomRunningRuns();
+    expect(r.fixedCount).toBe(1);
+    expect(r.fixedIds).toEqual(["RUN_PHANTOM_OLD"]);
+
+    const { Client } = await import("pg");
+    const c = new Client({ connectionString: TEST_URL });
+    await c.connect();
+    try {
+      const { rows } = await c.query(
+        "SELECT status, blocker, ended_at FROM ocean_bot_run WHERE id=$1",
+        ["RUN_PHANTOM_OLD"],
+      );
+      expect(rows[0]?.status).toBe("failed");
+      expect(rows[0]?.blocker).toMatch(/auto-cleanup: phantom running row/);
+      expect(rows[0]?.ended_at).not.toBeNull();
+    } finally {
+      await c.end();
+    }
+  });
+
+  it("leaves a recently-started 'running' row alone (false-positive guard for active runs)", async () => {
+    // 5min-old running row is a genuinely active session, the runner's
+    // 30-min inner timeout has not even fired yet. The sweep must NOT
+    // touch it.
+    await seedRun({
+      id: "RUN_PHANTOM_NEW",
+      status: "running",
+      taskId: "backlog:active-task",
+      startedAt: new Date(Date.now() - 5 * 60 * 1000),
+    });
+
+    const r = await sweep.sweepStalePhantomRunningRuns();
+    expect(r.fixedCount).toBe(0);
+
+    const { Client } = await import("pg");
+    const c = new Client({ connectionString: TEST_URL });
+    await c.connect();
+    try {
+      const { rows } = await c.query(
+        "SELECT status FROM ocean_bot_run WHERE id=$1",
+        ["RUN_PHANTOM_NEW"],
+      );
+      expect(rows[0]?.status).toBe("running");
+    } finally {
+      await c.end();
+    }
+  });
+
+  it("is idempotent: a second call on the same DB state finds nothing", async () => {
+    await seedRun({
+      id: "RUN_PHANTOM_IDEMP",
+      status: "running",
+      startedAt: new Date(Date.now() - 30 * 60 * 60 * 1000),
+    });
+    const first = await sweep.sweepStalePhantomRunningRuns();
+    expect(first.fixedCount).toBe(1);
+    const second = await sweep.sweepStalePhantomRunningRuns();
+    expect(second.fixedCount).toBe(0);
+  });
+
+  it("preserves an existing blocker via COALESCE (cleanup reason only stamped when blocker is null)", async () => {
+    // A row that's already-stamped with a meaningful blocker should keep
+    // that blocker; the cleanup only fills in the gap when blocker is
+    // NULL. Mirrors journal.ts#cleanupPhantomRuns semantics so the
+    // operator can tell "we lost track" from "the bot recorded why."
+    await seedRun({
+      id: "RUN_PHANTOM_WITH_BLOCKER",
+      status: "running",
+      blocker: "runner SIGKILLED externally",
+      startedAt: new Date(Date.now() - 26 * 60 * 60 * 1000),
+    });
+    const r = await sweep.sweepStalePhantomRunningRuns();
+    expect(r.fixedCount).toBe(1);
+
+    const { Client } = await import("pg");
+    const c = new Client({ connectionString: TEST_URL });
+    await c.connect();
+    try {
+      const { rows } = await c.query(
+        "SELECT status, blocker FROM ocean_bot_run WHERE id=$1",
+        ["RUN_PHANTOM_WITH_BLOCKER"],
+      );
+      expect(rows[0]?.status).toBe("failed");
+      expect(rows[0]?.blocker).toBe("runner SIGKILLED externally");
+    } finally {
+      await c.end();
+    }
+  });
+
+  it("respects a custom maxHours override (boundary at the cutoff)", async () => {
+    // Two rows: one at 2h old, one at 4h old. With maxHours=3 only the
+    // 4h-old row should flip; the 2h-old row is fresh. Pins the cutoff
+    // semantics in case future tuning lowers the default.
+    await seedRun({
+      id: "RUN_FRESH_2H",
+      status: "running",
+      startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+    await seedRun({
+      id: "RUN_STALE_4H",
+      status: "running",
+      startedAt: new Date(Date.now() - 4 * 60 * 60 * 1000),
+    });
+    const r = await sweep.sweepStalePhantomRunningRuns(3);
+    expect(r.fixedIds).toEqual(["RUN_STALE_4H"]);
+  });
+
+  it("ignores rows already in a terminal status (cross-check against accidental re-cleanup)", async () => {
+    // Defensive: a row that's already 'failed' or 'shipped' must not be
+    // touched even if its started_at is ancient. The status filter is
+    // the only thing keeping a re-cleanup from rewriting a real blocker.
+    for (const status of ["shipped", "failed", "approved"] as const) {
+      await seedRun({
+        id: `RUN_TERMINAL_${status.toUpperCase()}`,
+        status,
+        startedAt: new Date(Date.now() - 100 * 60 * 60 * 1000),
+      });
+    }
+    const r = await sweep.sweepStalePhantomRunningRuns();
+    expect(r.fixedCount).toBe(0);
+  });
+});
+
 D("health-sweep.runHealthSweep (orchestrator)", () => {
   beforeEach(truncate);
 
@@ -399,6 +535,14 @@ D("health-sweep.runHealthSweep (orchestrator)", () => {
         blocker: "no commit produced (no-op task)",
       });
     }
+    // 1 phantom-running row aged 25h to exercise the new sweep alongside
+    // the existing three.
+    await seedRun({
+      id: "RUN_ORCH_PHANTOM",
+      status: "running",
+      taskId: "backlog:phantom-task",
+      startedAt: new Date(Date.now() - 25 * 60 * 60 * 1000),
+    });
 
     const state = await sweep.runHealthSweep();
     expect(state.stale.fixedCount).toBe(1);
@@ -406,6 +550,8 @@ D("health-sweep.runHealthSweep (orchestrator)", () => {
     expect(state.stuckNoop).toHaveLength(1);
     expect(state.stuckNoop[0]?.taskId).toBe("backlog:noop-loop-task");
     expect(state.stuckPreflight).toHaveLength(0);
+    expect(state.stalePhantomRunning.fixedCount).toBe(1);
+    expect(state.stalePhantomRunning.fixedIds).toEqual(["RUN_ORCH_PHANTOM"]);
     expect(state.ranAt).toBeTruthy();
 
     // State row written for /health dashboard to read.
@@ -415,5 +561,6 @@ D("health-sweep.runHealthSweep (orchestrator)", () => {
     );
     expect(stored?.stale.fixedCount).toBe(1);
     expect(stored?.stuckNoop[0]?.taskId).toBe("backlog:noop-loop-task");
+    expect(stored?.stalePhantomRunning.fixedCount).toBe(1);
   });
 });

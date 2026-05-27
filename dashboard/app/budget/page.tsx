@@ -1,10 +1,9 @@
 import { budgetState, fiveHrWindowStart } from "@/lib/queries";
+import { LocalTime } from "@/components/local-time";
 import { cx } from "@/lib/cx";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 10;
-
-const FIVE_HR_MS = 5 * 60 * 60 * 1000;
 
 interface ProjectGate {
   project: string;
@@ -33,6 +32,14 @@ interface BudgetSnapshot {
   };
   fiveHr?: { inputTokens: number; outputTokens: number };
   sevenD?: { inputTokens: number; outputTokens: number };
+  /** Per-dimension reset times (Unix ms). Both 5hr dimensions reset at the
+   *  same time; both 7d dimensions reset at the same time. */
+  dimensionResets?: {
+    fiveHrInput: number;
+    fiveHrOutput: number;
+    sevenDInput: number;
+    sevenDOutput: number;
+  };
   /** Per-project sub-cap gates. Populated when caps.perProject is
    *  configured; absent (or empty record) means the single-pool gate is
    *  the only one in effect. */
@@ -65,28 +72,32 @@ export default async function Budget() {
         </section>
       )}
 
-      <FiveHrWindow start={windowStart} renderedAt={new Date()} />
+      <FiveHrWindow start={windowStart} resetMs={snap?.dimensionResets?.fiveHrInput} />
 
       <section className="grid gap-3 sm:grid-cols-2">
         <BudgetBar
           label="5hr input"
           used={snap?.fiveHr?.inputTokens ?? 0}
           cap={snap?.caps?.fiveHrInput ?? 0}
+          resetMs={snap?.dimensionResets?.fiveHrInput}
         />
         <BudgetBar
           label="5hr output"
           used={snap?.fiveHr?.outputTokens ?? 0}
           cap={snap?.caps?.fiveHrOutput ?? 0}
+          resetMs={snap?.dimensionResets?.fiveHrOutput}
         />
         <BudgetBar
           label="7d input"
           used={snap?.sevenD?.inputTokens ?? 0}
           cap={snap?.caps?.sevenDInput ?? 0}
+          resetMs={snap?.dimensionResets?.sevenDInput}
         />
         <BudgetBar
           label="7d output"
           used={snap?.sevenD?.outputTokens ?? 0}
           cap={snap?.caps?.sevenDOutput ?? 0}
+          resetMs={snap?.dimensionResets?.sevenDOutput}
         />
       </section>
 
@@ -155,7 +166,17 @@ function ProjectCard({ name, pg }: { name: string; pg: ProjectGate }) {
   );
 }
 
-function BudgetBar({ label, used, cap }: { label: string; used: number; cap: number }) {
+function BudgetBar({
+  label,
+  used,
+  cap,
+  resetMs,
+}: {
+  label: string;
+  used: number;
+  cap: number;
+  resetMs?: number;
+}) {
   const ratio = cap > 0 ? used / cap : 0;
   const pct = Math.min(100, ratio * 100);
   const color =
@@ -171,6 +192,11 @@ function BudgetBar({ label, used, cap }: { label: string; used: number; cap: num
       <div className="h-2 w-full overflow-hidden rounded bg-bg">
         <div className={cx("h-full", color)} style={{ width: `${pct}%` }} />
       </div>
+      {resetMs && (
+        <div className="mt-2 text-[10px] text-dim">
+          resets <LocalTime iso={new Date(resetMs).toISOString()} format="relative" />
+        </div>
+      )}
     </div>
   );
 }
@@ -182,18 +208,12 @@ function gateColor(gate?: string): string {
   return "text-dim";
 }
 
-// Shows the explicit 5hr window boundaries the bot anchors against, so
-// the operator can see "where am I in the current Anthropic billing
-// window" without inferring it from the oldest usage row. When the bot
-// hasn't stamped a window yet (null) we say so plainly; when the window
-// has run past its 5hr length we display "expired" until the next tick
-// clears the stamp.
 function FiveHrWindow({
   start,
-  renderedAt,
+  resetMs,
 }: {
   start: Date | null;
-  renderedAt: Date;
+  resetMs?: number;
 }) {
   if (!start) {
     return (
@@ -202,33 +222,19 @@ function FiveHrWindow({
       </section>
     );
   }
-  const elapsedMs = renderedAt.getTime() - start.getTime();
-  const remainingMs = FIVE_HR_MS - elapsedMs;
-  const ago = formatHhMm(Math.max(0, elapsedMs));
-  const expired = remainingMs <= 0;
   return (
     <section className="rounded border border-line bg-panel p-4 text-sm">
       <div className="text-dim">5hr window</div>
       <div className="mt-1 flex flex-col gap-0.5 text-ink sm:flex-row sm:gap-3">
         <span>
-          started <span className="font-bold">{ago}</span> ago
+          started <LocalTime iso={start.toISOString()} format="relative" />
         </span>
-        <span className={expired ? "text-warn" : "text-dim"}>
-          {expired
-            ? "expired (next tick will reset)"
-            : `resets in ${formatHhMm(remainingMs)}`}
-        </span>
+        {resetMs && (
+          <span className="text-dim">
+            resets <LocalTime iso={new Date(resetMs).toISOString()} format="relative" />
+          </span>
+        )}
       </div>
     </section>
   );
-}
-
-// Format a non-negative duration in ms as "H:MM" (no leading zero on
-// hours; mm zero-padded). Matches the spec wording "HH:MM ago, resets
-// in HH:MM" while staying readable for sub-1h windows ("0:23 ago").
-function formatHhMm(ms: number): string {
-  const totalMin = Math.floor(ms / 60000);
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return `${h}:${m.toString().padStart(2, "0")}`;
 }

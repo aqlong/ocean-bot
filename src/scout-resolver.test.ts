@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
+  applyGoalWrapper,
   buildResolverPrompt,
   clearResolverCache,
+  DEFAULT_GOAL_TURN_CAP,
   fallbackOnFailure,
   hashResolverInput,
   parseResolverResponse,
@@ -61,6 +63,75 @@ describe("parseResolverResponse", () => {
     });
     const r = parseResolverResponse(text);
     expect(r).toEqual({ verdict: "proceed", explanation: "no rewrite needed" });
+  });
+
+  it("picks up acceptanceCriteria when present on a proceed verdict", () => {
+    const text = JSON.stringify({
+      verdict: "proceed",
+      explanation: "concrete pass/fail check available",
+      acceptanceCriteria: "npm test exits 0 and audit verify passes",
+    });
+    const r = parseResolverResponse(text);
+    expect(r).toEqual({
+      verdict: "proceed",
+      explanation: "concrete pass/fail check available",
+      acceptanceCriteria: "npm test exits 0 and audit verify passes",
+    });
+  });
+
+  it("drops empty-string acceptanceCriteria (treated as unset)", () => {
+    const text = JSON.stringify({
+      verdict: "proceed",
+      explanation: "no concrete check",
+      acceptanceCriteria: "   ",
+    });
+    const r = parseResolverResponse(text);
+    expect(r).toEqual({ verdict: "proceed", explanation: "no concrete check" });
+  });
+
+  it("drops acceptanceCriteria on non-proceed verdicts (defensive against prompt drift)", () => {
+    // The prompt instructs the model to skip the field outside proceed,
+    // but if it leaks through anyway, route it nowhere. A skip with stray
+    // criteria would just confuse the gate event on the dashboard.
+    for (const verdict of ["skip", "escalate", "block"] as const) {
+      const text = JSON.stringify({
+        verdict,
+        explanation: "test",
+        acceptanceCriteria: "should not survive",
+      });
+      const r = parseResolverResponse(text);
+      expect(r?.verdict).toBe(verdict);
+      expect(r?.acceptanceCriteria).toBeUndefined();
+    }
+  });
+
+  it("strips whitespace from acceptanceCriteria", () => {
+    const text = JSON.stringify({
+      verdict: "proceed",
+      explanation: "ok",
+      acceptanceCriteria: "  the new test in foo.test.ts passes  ",
+    });
+    const r = parseResolverResponse(text);
+    expect(r?.acceptanceCriteria).toBe("the new test in foo.test.ts passes");
+  });
+
+  it("coexists with clarifiedScope on the same proceed verdict", () => {
+    // Both fields are independent. clarifiedScope rewrites the task body
+    // (inside the /goal envelope); acceptanceCriteria becomes the
+    // condition (outside). Compose, don't pick one.
+    const text = JSON.stringify({
+      verdict: "proceed",
+      explanation: "narrowed + measurable",
+      clarifiedScope: "CFML only; skip Java parser path",
+      acceptanceCriteria: "src/core/parsers/cfml.test.ts passes",
+    });
+    const r = parseResolverResponse(text);
+    expect(r).toEqual({
+      verdict: "proceed",
+      explanation: "narrowed + measurable",
+      clarifiedScope: "CFML only; skip Java parser path",
+      acceptanceCriteria: "src/core/parsers/cfml.test.ts passes",
+    });
   });
 
   it("rejects unknown verdict values", () => {
@@ -186,6 +257,110 @@ describe("buildResolverPrompt", () => {
     // optimistically split a mixed task into "do the shell part now,
     // escalate the rest later."
     expect(prompt).toMatch(/BOTH[\s\S]*browser[\s\S]*escalate/i);
+  });
+
+  it("declares acceptanceCriteria as a 5th JSON key in the output shape", () => {
+    // The shape declaration is load-bearing: drift here is the first
+    // place the model will hallucinate (different key name, different
+    // type). Pin both the key name and that it sits under the proceed
+    // gating note.
+    const prompt = buildResolverPrompt("any", ["any"]);
+    expect(prompt).toContain('"acceptanceCriteria"');
+    // The output-shape section must mention that the field is optional
+    // and proceed-only, so the model treats it like clarifiedScope.
+    expect(prompt).toMatch(/acceptanceCriteria.*optional/i);
+  });
+
+  it("includes the ACCEPTANCE CRITERIA rubric with concrete-check examples", () => {
+    const prompt = buildResolverPrompt("any", ["any"]);
+    // The rubric must call out the three gating conditions (proceed,
+    // observable check, half-done-task risk) so sonnet doesn't over-emit
+    // the field on routine clarifications.
+    expect(prompt).toMatch(/ACCEPTANCE CRITERIA/);
+    expect(prompt).toMatch(/npm test/);
+    expect(prompt).toMatch(/half-done/i);
+  });
+
+  it("documents the /goal wrapper + 5-turn cap so the model knows what its criterion fuels", () => {
+    const prompt = buildResolverPrompt("any", ["any"]);
+    // Without this, the model writes criteria for the wrong evaluator
+    // (e.g., a vague subjective check that Haiku can't judge).
+    expect(prompt).toMatch(/\/goal/);
+    expect(prompt).toMatch(/5 turns/);
+  });
+
+  it("instructs the model to SKIP acceptanceCriteria for routine clarifications", () => {
+    const prompt = buildResolverPrompt("any", ["any"]);
+    // The evaluator costs ~168 Haiku tokens per turn; pin the cost-
+    // benefit so the model is biased toward omitting the field.
+    expect(prompt).toMatch(/SKIP acceptanceCriteria/);
+    expect(prompt).toMatch(/Haiku/);
+  });
+});
+
+describe("applyGoalWrapper", () => {
+  it("returns the prompt unchanged when verdict is not 'proceed'", () => {
+    for (const verdict of ["skip", "escalate", "block"] as const) {
+      const res: ScoutResolution = {
+        verdict,
+        explanation: "x",
+        acceptanceCriteria: "should not be used",
+      };
+      expect(applyGoalWrapper("original prompt", res)).toBe("original prompt");
+    }
+  });
+
+  it("returns the prompt unchanged when acceptanceCriteria is unset on proceed", () => {
+    const res: ScoutResolution = {
+      verdict: "proceed",
+      explanation: "ok",
+    };
+    expect(applyGoalWrapper("original prompt", res)).toBe("original prompt");
+  });
+
+  it("wraps the prompt with /goal + 5-turn cap when criteria is set", () => {
+    const res: ScoutResolution = {
+      verdict: "proceed",
+      explanation: "measurable",
+      acceptanceCriteria: "npm test exits 0",
+    };
+    const wrapped = applyGoalWrapper("do the thing", res);
+    // The full claude-internal format: /goal <criteria> or stop after N turns\n\n<prompt>
+    expect(wrapped).toBe(
+      "/goal npm test exits 0 or stop after 5 turns\n\ndo the thing",
+    );
+  });
+
+  it("honors a custom turn cap when supplied (defends against silent drift of the default)", () => {
+    const res: ScoutResolution = {
+      verdict: "proceed",
+      explanation: "x",
+      acceptanceCriteria: "audit verify passes",
+    };
+    const wrapped = applyGoalWrapper("prompt", res, 3);
+    expect(wrapped).toContain("or stop after 3 turns");
+    expect(wrapped).toContain("audit verify passes");
+  });
+
+  it("uses DEFAULT_GOAL_TURN_CAP=5 (pinned constant prevents accidental retunes)", () => {
+    // The 5-turn cap is documented in the backlog rationale and feeds
+    // into operator expectations on /runs/[id]. Bump deliberately.
+    expect(DEFAULT_GOAL_TURN_CAP).toBe(5);
+  });
+
+  it("preserves the prompt body verbatim (no escaping, no trimming)", () => {
+    // The body is the model's actual task prompt, including any
+    // clarifiedScope rewrite from earlier in the resolver pipeline.
+    // We must NOT mutate it (escaping JSON, trimming whitespace, etc.)
+    // because that would silently change the bot's behavior.
+    const body = "Multi-line\ntask\n  with indentation";
+    const res: ScoutResolution = {
+      verdict: "proceed",
+      explanation: "x",
+      acceptanceCriteria: "ok",
+    };
+    const wrapped = applyGoalWrapper(body, res);
+    expect(wrapped.endsWith(body)).toBe(true);
   });
 });
 
@@ -378,6 +553,33 @@ describe("resolveScoutScope", () => {
     });
     expect(r.result?.verdict).toBe("escalate");
     expect(r.result?.explanation).toMatch(/stripe|browser/i);
+  });
+
+  it("returns a proceed verdict with acceptanceCriteria when the model emits one", async () => {
+    // End-to-end across the spawn boundary: the criteria field must
+    // survive the JSON → ResolverOutcome → ScoutResolution conversion
+    // intact. Previous bug class (clarifiedScope) was a parser drop
+    // that only surfaced via integration tests.
+    const r = await resolveScoutScope({
+      description: "Fix the validator's em-dash false positive",
+      scopeWarnings: ["which fixture covers this case?"],
+      cwd: "/tmp",
+      spawnFn: async () => ({
+        stdout: JSON.stringify({
+          verdict: "proceed",
+          explanation: "clear pass/fail check",
+          acceptanceCriteria:
+            "the failing em-dash fixture passes and the rest of the suite stays green",
+        }),
+        exitCode: 0,
+        timedOut: false,
+      }),
+    });
+    expect(r.result?.verdict).toBe("proceed");
+    expect(r.result?.acceptanceCriteria).toBe(
+      "the failing em-dash fixture passes and the rest of the suite stays green",
+    );
+    expect(r.failure).toBeNull();
   });
 
   it("serves the second call from cache (no re-spawn)", async () => {

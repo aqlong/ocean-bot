@@ -17,6 +17,12 @@ import * as os from "node:os";
 const FIVE_HR_MS = 5 * 60 * 60 * 1000;
 const SEVEN_D_MS = 7 * 24 * 60 * 60 * 1000;
 
+// /goal evaluator overhead (Haiku tokens per evaluator turn, not visible in stream-json).
+// Measured 2026-05-22: 3-turn /goal session billed 520 total output tokens, stream
+// showed 16 from main turns, leaving 504 for evaluator (168 per turn). Fudge factor
+// accounts for evaluator cost that doesn't appear in stream events but IS billed.
+const GOAL_EVALUATOR_OUTPUT_OVERHEAD = 168;
+
 export interface BudgetCaps {
   /** Bot-attributed input tokens allowed per 5hr rolling window. */
   fiveHrInput: number;
@@ -116,6 +122,10 @@ export interface BudgetDecision {
   /** Unix ms when the binding constraint window will reset.
    *  Anchored 5hr window → anchor + 5hr; rolling → oldest in-window row + window. */
   nextResetMs?: number;
+  /** Per-dimension reset times (Unix ms). Both 5hr dimensions reset at the
+   *  same time; both 7d dimensions reset at the same time. Used by the
+   *  dashboard to show per-dimension reset countdowns. */
+  dimensionResets?: DimensionReset;
   /** True when the supplied fiveHrWindowStart anchor is older than the
    *  5hr window. The caller should clearFiveHrWindowStart() so the next
    *  tick with bot activity can re-stamp a fresh anchor. The decision's
@@ -131,6 +141,13 @@ const EMPTY_TOTALS: WindowTotals = {
   cacheWrite: 0,
 };
 
+export interface DimensionReset {
+  fiveHrInput: number;
+  fiveHrOutput: number;
+  sevenDInput: number;
+  sevenDOutput: number;
+}
+
 export interface BudgetInputs {
   rows: UsageRow[];
   botSessionPaths: Set<string>;
@@ -144,6 +161,63 @@ export interface BudgetInputs {
    *    true and 5hr math falls back to rolling, caller clears the
    *    anchor so the next tick with bot activity stamps a fresh one. */
   fiveHrWindowStart?: number | null;
+}
+
+/** Account for /goal evaluator overhead by estimating evaluator turns based
+ *  on output tokens. If output suggests /goal was used (evaluator cost not
+ *  visible in stream-json), add the fudge factor per estimated turn. */
+export function estimateGoalOverhead(outputTokens: number): number {
+  // /goal evaluator runs once per main turn. If output_tokens seem suspiciously
+  // low relative to input (common with cache hits + evaluator overhead), estimate
+  // and add overhead. Heuristic: if output < input/100 and output > 0, likely /goal.
+  // For now, conservatively add 1-turn overhead if the ratio suggests evaluator was active.
+  // This is imperfect but safer than undercounting.
+  if (outputTokens > 0 && outputTokens < 500) {
+    // Conservative: add overhead for 1 evaluator turn (1-turn safety margin).
+    // Real sessions may use 1-5 turns; 1 is the safe underestimate.
+    return GOAL_EVALUATOR_OUTPUT_OVERHEAD;
+  }
+  return 0;
+}
+
+/** Compute Unix-ms reset times for each dimension. Both 5hr dimensions
+ *  reset at the same time (anchor + 5hr or oldest 5hr row + 5hr); both
+ *  7d dimensions reset at the same time (oldest 7d row + 7d). Returns
+ *  reset times for all four dimensions for dashboard display. */
+export function computeDimensionResets(input: {
+  rows: UsageRow[];
+  botSessionPaths: Set<string>;
+  now: number;
+  fiveHrWindowStart?: number | null;
+}): DimensionReset {
+  const { rows, botSessionPaths, now } = input;
+  const anchor = input.fiveHrWindowStart ?? null;
+
+  const botRows = rows.filter((r) => botSessionPaths.has(r.sessionPath));
+  const fiveHrRows = botRows.filter((r) => now - r.ts <= FIVE_HR_MS);
+  const sevenDRows = botRows.filter((r) => now - r.ts <= SEVEN_D_MS);
+
+  // 5hr reset: anchor + 5hr if anchor is set, else oldest 5hr row + 5hr, else now
+  const fiveHrResetMs = (() => {
+    if (anchor !== null && anchor !== undefined) return anchor + FIVE_HR_MS;
+    if (fiveHrRows.length === 0) return now;
+    const oldest = Math.min(...fiveHrRows.map((r) => r.ts));
+    return oldest + FIVE_HR_MS;
+  })();
+
+  // 7d reset: oldest 7d row + 7d, else now
+  const sevenDResetMs = (() => {
+    if (sevenDRows.length === 0) return now;
+    const oldest = Math.min(...sevenDRows.map((r) => r.ts));
+    return oldest + SEVEN_D_MS;
+  })();
+
+  return {
+    fiveHrInput: fiveHrResetMs,
+    fiveHrOutput: fiveHrResetMs,
+    sevenDInput: sevenDResetMs,
+    sevenDOutput: sevenDResetMs,
+  };
 }
 
 export function decideBudget(input: BudgetInputs): BudgetDecision {
@@ -163,19 +237,31 @@ export function decideBudget(input: BudgetInputs): BudgetDecision {
   const fiveHr = sumRows(fiveHrRows);
   const sevenD = sumRows(sevenDRows);
 
+  // Add /goal evaluator overhead estimate to output tokens (not visible in stream-json but billed).
+  // This makes cap comparisons account for the hidden evaluator cost per turn.
+  const fiveHrWithGoalOverhead = {
+    ...fiveHr,
+    outputTokens: fiveHr.outputTokens + estimateGoalOverhead(fiveHr.outputTokens),
+  };
+  const sevenDWithGoalOverhead = {
+    ...sevenD,
+    outputTokens: sevenD.outputTokens + estimateGoalOverhead(sevenD.outputTokens),
+  };
+
   const ratios = [
-    fiveHr.inputTokens / caps.fiveHrInput,
-    fiveHr.outputTokens / caps.fiveHrOutput,
-    sevenD.inputTokens / caps.sevenDInput,
-    sevenD.outputTokens / caps.sevenDOutput,
+    fiveHrWithGoalOverhead.inputTokens / caps.fiveHrInput,
+    fiveHrWithGoalOverhead.outputTokens / caps.fiveHrOutput,
+    sevenDWithGoalOverhead.inputTokens / caps.sevenDInput,
+    sevenDWithGoalOverhead.outputTokens / caps.sevenDOutput,
   ];
   const worstRatio = Math.max(...ratios);
 
   // Which window is the binding constraint? Used to compute nextResetMs.
+  // Use overhead-adjusted values to match the worstRatio calculation.
   const bindingIs5hr =
     Math.max(
-      fiveHr.inputTokens / caps.fiveHrInput,
-      fiveHr.outputTokens / caps.fiveHrOutput,
+      fiveHrWithGoalOverhead.inputTokens / caps.fiveHrInput,
+      fiveHrWithGoalOverhead.outputTokens / caps.fiveHrOutput,
     ) === worstRatio;
 
   let nextResetMs: number | undefined;
@@ -192,12 +278,20 @@ export function decideBudget(input: BudgetInputs): BudgetDecision {
     }
   }
 
+  const dimensionResets = computeDimensionResets({
+    rows,
+    botSessionPaths,
+    now,
+    fiveHrWindowStart: effectiveAnchor,
+  });
+
   const base = {
     fiveHr,
     sevenD,
     caps,
     worstRatio,
     nextResetMs,
+    dimensionResets,
     ...(anchorExpired ? { fiveHrWindowExpired: true as const } : {}),
   };
 
@@ -293,11 +387,20 @@ export function decideProjectBudgets(
       sevenDOutput: caps.sevenDOutput * share,
     };
 
+    // Mirror decideBudget: add hidden /goal evaluator overhead to output
+    // before ratio math. Per-project totals stay untouched (display value)
+    // but the ratio adjustment matches what we do at the global gate so
+    // sub-cap triggers fire at the same evaluator-aware threshold.
+    const fiveHrOutputAdjusted =
+      fiveHr.outputTokens + estimateGoalOverhead(fiveHr.outputTokens);
+    const sevenDOutputAdjusted =
+      sevenD.outputTokens + estimateGoalOverhead(sevenD.outputTokens);
+
     const ratios = [
       subCaps.fiveHrInput > 0 ? fiveHr.inputTokens / subCaps.fiveHrInput : 0,
-      subCaps.fiveHrOutput > 0 ? fiveHr.outputTokens / subCaps.fiveHrOutput : 0,
+      subCaps.fiveHrOutput > 0 ? fiveHrOutputAdjusted / subCaps.fiveHrOutput : 0,
       subCaps.sevenDInput > 0 ? sevenD.inputTokens / subCaps.sevenDInput : 0,
-      subCaps.sevenDOutput > 0 ? sevenD.outputTokens / subCaps.sevenDOutput : 0,
+      subCaps.sevenDOutput > 0 ? sevenDOutputAdjusted / subCaps.sevenDOutput : 0,
     ];
     const worstRatio = Math.max(...ratios);
 

@@ -547,6 +547,115 @@ export async function markBacklogItemDone(
   }
 }
 
+/**
+ * List ids of currently-open backlog items for a given project.
+ *
+ * Used by the receive-side auto-close path: after every ship, fetch
+ * open ids, check if the commit message references any of them, close
+ * those that match. Per-project filter is load-bearing, a code2wiki
+ * ship must never close an ocean-bot item or vice versa.
+ *
+ * Best-effort: returns [] on db failure so the ship path doesn't break.
+ */
+export async function listOpenBacklogIds(project: string): Promise<string[]> {
+  try {
+    const rows = await getDb()
+      .select({ id: schema.oceanBotBacklogItem.id })
+      .from(schema.oceanBotBacklogItem)
+      .where(
+        and(
+          eq(schema.oceanBotBacklogItem.status, "open"),
+          eq(schema.oceanBotBacklogItem.project, project),
+        ),
+      );
+    return rows.map((r) => r.id);
+  } catch (e) {
+    log.error("journal.listOpenBacklogIds failed", { err: errMsg(e) });
+    return [];
+  }
+}
+
+/**
+ * Pure helper. Find backlog ids whose full string appears in the commit
+ * message as a whole token (not a substring of another id).
+ *
+ * Kebab-case-id-safe: rejects substring matches like `dotnet-1` inside
+ * `dotnet-10`. JS \b doesn't treat `-` as a word-boundary character
+ * (hyphen is non-word, so \b fires AT the hyphen), so this uses explicit
+ * lookarounds that include `-` in the "still inside an id" predicate.
+ *
+ * Exported (and unit-tested) because false-positive auto-closes are
+ * expensive (an item is silently removed from the queue), and the only
+ * way to keep them away is to be conservative + reviewable.
+ */
+export function findReferencedBacklogIds(
+  message: string,
+  openIds: readonly string[],
+): string[] {
+  if (!message || openIds.length === 0) return [];
+  const found = new Set<string>();
+  for (const id of openIds) {
+    const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`);
+    if (re.test(message)) found.add(id);
+  }
+  return [...found];
+}
+
+/**
+ * Close one or more backlog items with audit metadata pointing at the
+ * closing commit + run.
+ *
+ * Used by the receive-side auto-close path (creative / refactor / etc
+ * ships whose commit message references an open backlog id).
+ *
+ * Idempotent: the WHERE-status='open' guard makes already-done items
+ * no-op without overwriting their existing closed metadata. Per-item
+ * try-catch so a single failure doesn't lose the rest.
+ *
+ * Fixes the stale-open class that bit dotnet-* 2026-05-22 -> 2026-05-26:
+ * the C# parser shipped via creative queue (06e276f) and none of the
+ * dotnet-2..10 backlog items got closed because markBacklogItemDone
+ * only fires for taskIds with the `backlog:` prefix. Now any commit
+ * message that names an open id closes that id.
+ */
+export async function closeBacklogItemsByIds(
+  itemIds: readonly string[],
+  closingCommit: string,
+  runId: string,
+  reason: string,
+): Promise<void> {
+  if (itemIds.length === 0) return;
+  for (const itemId of itemIds) {
+    const meta = {
+      closed_reason: reason,
+      closed_at: new Date().toISOString(),
+      closing_commit: closingCommit,
+      closing_run_id: runId,
+    };
+    try {
+      await getDb()
+        .update(schema.oceanBotBacklogItem)
+        .set({
+          status: "done",
+          updatedAt: new Date(),
+          metadata: sql`COALESCE(${schema.oceanBotBacklogItem.metadata}, '{}'::jsonb) || ${JSON.stringify(meta)}::jsonb`,
+        })
+        .where(
+          and(
+            eq(schema.oceanBotBacklogItem.id, itemId),
+            eq(schema.oceanBotBacklogItem.status, "open"),
+          ),
+        );
+    } catch (e) {
+      log.error("journal.closeBacklogItemsByIds failed", {
+        itemId,
+        err: errMsg(e),
+      });
+    }
+  }
+}
+
 // ============================================================================
 // Rate-limit pause state (ADR-034 seed: 429-handling, pre-6/15-cutover).
 // Two DB entries:

@@ -1,7 +1,7 @@
 import { pendingApprovals } from "@/lib/queries";
 import { approveRun } from "./actions";
 import { cx } from "@/lib/cx";
-import { LocalTime } from "./local-time";
+import { LocalTime } from "../../src/components/local-time";
 import { summaryPreview } from "./summary-preview";
 import { ProjectChip } from "@/components/ProjectChip";
 import { AutoRefreshIndicator } from "@/components/AutoRefreshIndicator";

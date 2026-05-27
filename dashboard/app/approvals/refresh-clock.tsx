@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { LocalTime } from "./local-time";
+import { LocalTime } from "../../src/components/local-time";
 
 /**
  * Client-side auto-refresh + last-refreshed clock.

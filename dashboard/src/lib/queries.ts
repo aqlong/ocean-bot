@@ -363,6 +363,12 @@ export interface HealthSweepSnapshot {
   stuckNoop: HealthSweepStuckGroup[];
   stuckPreflight: HealthSweepStuckGroup[];
   staleApproved: HealthSweepStuckGroup[];
+  /** Phantom 'running' rows flipped to 'failed' by the last sweep
+   *  because they sat past the stale-running window (default 24h) with
+   *  no terminal event. Pre-sweep installs see 0; legitimately-active
+   *  runs are below the cutoff so the steady-state target is 0. */
+  fixedStalePhantomRunning: number;
+  fixedStalePhantomRunningIds: string[];
 }
 
 export async function lastHealthSweep(): Promise<HealthSweepSnapshot | null> {
@@ -380,6 +386,7 @@ export async function lastHealthSweep(): Promise<HealthSweepSnapshot | null> {
         stuckNoop?: HealthSweepStuckGroup[];
         stuckPreflight?: HealthSweepStuckGroup[];
         staleApproved?: HealthSweepStuckGroup[];
+        stalePhantomRunning?: { fixedCount?: number; fixedIds?: string[] };
       }
     | null;
   if (!v) return null;
@@ -392,5 +399,12 @@ export async function lastHealthSweep(): Promise<HealthSweepSnapshot | null> {
     stuckNoop: Array.isArray(v.stuckNoop) ? v.stuckNoop : [],
     stuckPreflight: Array.isArray(v.stuckPreflight) ? v.stuckPreflight : [],
     staleApproved: Array.isArray(v.staleApproved) ? v.staleApproved : [],
+    fixedStalePhantomRunning:
+      typeof v.stalePhantomRunning?.fixedCount === "number"
+        ? v.stalePhantomRunning.fixedCount
+        : 0,
+    fixedStalePhantomRunningIds: Array.isArray(v.stalePhantomRunning?.fixedIds)
+      ? v.stalePhantomRunning.fixedIds
+      : [],
   };
 }

@@ -45,6 +45,15 @@ export async function headSha(cwd: string): Promise<string> {
   return r.stdout.trim();
 }
 
+/** Full commit message (subject + body, %B) for the given sha. Returns
+ *  empty string on git failure so callers can treat it as "no info" and
+ *  fall through to the no-op path rather than throwing. */
+export async function commitMessage(cwd: string, sha: string): Promise<string> {
+  const r = await git(cwd, ["show", "-s", "--format=%B", sha]);
+  if (r.code !== 0) return "";
+  return r.stdout;
+}
+
 export async function diffStaged(cwd: string): Promise<DiffSummary> {
   return parseGitDiff(await git(cwd, ["diff", "--cached"]));
 }

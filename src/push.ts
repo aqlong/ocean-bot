@@ -11,6 +11,7 @@ import type {
 import { splitDangerReasons } from "./classifier.js";
 import { log } from "./util/log.js";
 import { git, isClean } from "./util/git.js";
+import { buildSafeChildEnv } from "./util/safe-env.js";
 
 export interface PreflightResult {
   ok: boolean;
@@ -45,7 +46,10 @@ function runShell(
   cwd: string,
 ): Promise<{ exitCode: number; combined: string }> {
   return new Promise((resolve) => {
-    const p = spawn("bash", ["-lc", cmd], { cwd });
+    const p = spawn("bash", ["-lc", cmd], {
+      cwd,
+      env: buildSafeChildEnv(process.env),
+    });
     let combined = "";
     p.stdout.on("data", (d) => (combined += d.toString()));
     p.stderr.on("data", (d) => (combined += d.toString()));
