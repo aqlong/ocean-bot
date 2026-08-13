@@ -154,7 +154,7 @@ npm test          # vitest
 npm run typecheck # tsc --noEmit
 ```
 
-Roughly a fifth of the suite is integration tests against a real Postgres, so they are gated on an env var and skip cleanly when it is absent. To run everything:
+78 of the 625 tests here are integration tests against a real Postgres, so they are gated on an env var and skip cleanly when it is absent. To run everything:
 
 ```bash
 createdb ocean_bot_test
