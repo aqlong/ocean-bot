@@ -113,11 +113,20 @@ echo "  ok"
 # entire bot lifetime. If rotation mv'd the active file, the FD would
 # keep the old inode alive and new writes would never appear in the
 # truncated .log slot. Pin inode preservation here.
+# Portable inode read. BSD stat (macOS, the production host) spells this
+# `-f %i`; GNU coreutils (Linux, CI) spells it `-c %i` and errors on -f
+# with "cannot read file system information". The property being tested is
+# filesystem semantics, not a platform quirk, so the probe has to work on
+# both or this test silently becomes macOS-only.
+inode_of() {
+  stat -c %i "$1" 2>/dev/null || stat -f %i "$1"
+}
+
 echo "test 4: active file inode is preserved across rotation"
 echo "before-inode-test" > "$TMP_DIR/ocean-bot.log"
-INODE_BEFORE="$(stat -f %i "$TMP_DIR/ocean-bot.log")"
+INODE_BEFORE="$(inode_of "$TMP_DIR/ocean-bot.log")"
 OCEAN_BOT_LOGROTATE_DIR="$TMP_DIR" bash "$ROTATE_SCRIPT" --rotate
-INODE_AFTER="$(stat -f %i "$TMP_DIR/ocean-bot.log")"
+INODE_AFTER="$(inode_of "$TMP_DIR/ocean-bot.log")"
 if [ "$INODE_BEFORE" != "$INODE_AFTER" ]; then
   fail "active file inode changed across rotation ($INODE_BEFORE -> $INODE_AFTER); cp+truncate semantics are broken; the bot's open FD would write to the rotated copy"
 fi
