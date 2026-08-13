@@ -11,7 +11,7 @@
 //   8. Mark run shipped/awaiting-approval/failed; update state; release lock
 
 import * as path from "node:path";
-import { promises as fs } from "node:fs";
+import { promises as fs, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   loadConfig,
@@ -1330,17 +1330,34 @@ function errMsg(e: unknown): string {
  * unit test, so the ordering of the gates it wires was verified only by
  * reading it.
  *
- * Compared against a resolved path rather than by string-comparing
- * `import.meta.url` to `file://${process.argv[1]}`. The naive form breaks
- * whenever the path needs URL encoding (a space anywhere in the install
- * directory is enough) and would silently stop launching the bot. Same
- * check, done in a way that cannot misfire on a path we do not control.
+ * This comparison gets more care than the usual one-liner because its
+ * failure mode is silent: a false negative means launchd starts the
+ * process, nothing runs, and nothing is logged. Two ways the common
+ * shorthand `import.meta.url === \`file://${process.argv[1]}\`` gets it
+ * wrong, neither of which announces itself:
+ *
+ *   - URL encoding. One space anywhere in the install path and the string
+ *     compare fails while both paths refer to the same file.
+ *   - Symlinks. Node resolves the real path for `import.meta.url` but
+ *     leaves `process.argv[1]` as the caller typed it, so installing the
+ *     repo behind a symlinked directory breaks the match.
+ *
+ * Comparing real paths handles both. realpathSync throws only if a path
+ * disappeared between spawn and this line; falling back to a plain resolve
+ * keeps a vanished file from being the reason the bot will not boot.
  */
-const isCliRun =
-  process.argv[1] !== undefined &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+function isEntryPoint(): boolean {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  const self = fileURLToPath(import.meta.url);
+  try {
+    return realpathSync(invoked) === realpathSync(self);
+  } catch {
+    return path.resolve(invoked) === self;
+  }
+}
 
-if (isCliRun) {
+if (isEntryPoint()) {
   main().catch((e) => {
     log.error("ocean-bot.fatal", { err: errMsg(e) });
     process.exit(1);
