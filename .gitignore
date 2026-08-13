@@ -12,3 +12,6 @@ dist/
 .env.test.local
 logs/
 .turbo/
+
+# vitest --outputFile.json from the CI skip-count assertion
+vitest-report.json

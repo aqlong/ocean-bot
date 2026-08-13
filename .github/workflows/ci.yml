@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Both jobs attach a Postgres service deliberately. Roughly a fifth of this
+# repo's tests are integration tests against a real database, gated on
+# OCEAN_BOT_TEST_DATABASE_URL so a contributor without Postgres can still
+# run `npm test`. Without the service in CI they skip silently: the summary
+# says "passed" while 153 tests never ran. Attaching Postgres and then
+# asserting the skip count is zero is what makes a green check mean
+# something.
+
+jobs:
+  bot:
+    name: bot (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 is the floor declared in package.json engines; 22 is what the
+        # production launchd deploy runs. Testing both catches a stdlib or
+        # syntax assumption that only holds on one.
+        node: ["20", "22"]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ocean_bot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      OCEAN_BOT_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocean_bot_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm ci
+
+      - name: Apply migrations
+        # Ordered, with ON_ERROR_STOP so a broken migration fails here
+        # rather than surfacing later as confusing query errors.
+        run: |
+          for f in drizzle/*.sql; do
+            echo "applying $f"
+            psql "$OCEAN_BOT_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - run: npm run typecheck
+
+      - name: Test
+        run: npm test -- --reporter=default --reporter=json --outputFile.json=vitest-report.json
+
+      - name: Assert the database tests actually ran
+        # Measured locally: 78 pending without the service, 0 with it.
+        run: |
+          pending=$(node -p "require('./vitest-report.json').numPendingTests ?? 0")
+          total=$(node -p "require('./vitest-report.json').numTotalTests ?? 0")
+          echo "ran $total tests, $pending skipped"
+          if [ "$pending" -ne 0 ]; then
+            echo "::error::$pending test(s) skipped. The Postgres-backed suite must run in CI."
+            exit 1
+          fi
+
+      - run: npm run build
+
+      - name: Shell harnesses
+        # The launch wrapper and the logrotate installer are bash with their
+        # own harnesses. They gate boot behavior (branch pinning, stale-dist
+        # rebuild, log retention), so they belong in CI rather than in a
+        # "remember to run this" note.
+        run: |
+          bash scripts/ocean-bot-launch.test.sh
+          bash scripts/install-logrotate.test.sh
+
+  dashboard:
+    name: dashboard
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ocean_bot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Note this is the TEST database variable. The app's own runtime
+      # variable (OCEAN_BOT_DATABASE_URL) is deliberately never set in this
+      # job, which is what lets the build step below mean what it says.
+      OCEAN_BOT_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocean_bot_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Apply migrations
+        # The dashboard reads the same tables the agent writes, so its
+        # integration tests run against the agent's schema.
+        run: |
+          for f in drizzle/*.sql; do
+            echo "applying $f"
+            psql "$OCEAN_BOT_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - working-directory: dashboard
+        run: npm ci
+
+      - working-directory: dashboard
+        run: npm run typecheck
+
+      - name: Test
+        working-directory: dashboard
+        run: npm test -- --reporter=default --reporter=json --outputFile.json=vitest-report.json
+
+      - name: Assert the database tests actually ran
+        working-directory: dashboard
+        # Measured locally: 75 pending without the service, 0 with it.
+        run: |
+          pending=$(node -p "require('./vitest-report.json').numPendingTests ?? 0")
+          total=$(node -p "require('./vitest-report.json').numTotalTests ?? 0")
+          echo "ran $total tests, $pending skipped"
+          if [ "$pending" -ne 0 ]; then
+            echo "::error::$pending test(s) skipped. The Postgres-backed suite must run in CI."
+            exit 1
+          fi
+
+      - name: Build with no database configured
+        working-directory: dashboard
+        # The real regression guard for a build-time database dependency.
+        # `next build` imports every route module while collecting page
+        # data, and this app used to construct its Auth.js Drizzle adapter
+        # at module scope, which made a reachable Postgres a BUILD
+        # requirement: a fresh clone could not compile. OCEAN_BOT_DATABASE_URL
+        # is deliberately absent here. If this step ever needs it, the
+        # coupling has come back.
+        run: npm run build
