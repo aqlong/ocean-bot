@@ -408,7 +408,7 @@ describe("resolveCaps", () => {
 // (2) configured project with zero usage gets an "ok" row at 0%;
 // (3) sub-cap stop when project usage exceeds share*global;
 // (4) sub-cap wait when within warnRatio band;
-// (5) overlapping 0.6 + 0.6 shares are INDEPENDENT — one project at
+// (5) overlapping 0.6 + 0.6 shares are INDEPENDENT, one project at
 //     cap does NOT block the other.
 
 describe("decideProjectBudgets", () => {
@@ -497,7 +497,7 @@ describe("decideProjectBudgets", () => {
     // decideBudget so a low-output session is recognised as /goal-driven
     // and counted realistically. Per-project gates share the same input
     // (output tokens come from the same stream-json) so the parity is
-    // load-bearing — without it a project's sub-cap would silently
+    // load-bearing, without it a project's sub-cap would silently
     // undercount evaluator usage by 168 tokens per /goal turn.
     //
     // tightCaps below set fiveHrOutput=300, with share=0.5 the sub-cap
@@ -528,7 +528,7 @@ describe("decideProjectBudgets", () => {
     const c2w = out.get("code2wiki")!;
     expect(c2w.gate).toBe("stop");
     expect(c2w.worstRatio).toBeGreaterThan(1.0);
-    // Displayed totals stay unmodified — overhead is ratio-only.
+    // Displayed totals stay unmodified, overhead is ratio-only.
     expect(c2w.fiveHr.outputTokens).toBe(50);
     expect(c2w.sevenD.outputTokens).toBe(50);
   });

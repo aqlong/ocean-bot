@@ -10,7 +10,7 @@
 # Run once after pulling the v2 installer:
 #   ./scripts/migrate-secrets-to-sidecar.sh
 #
-# Idempotent — re-running after migration succeeds is a no-op (the env
+# Idempotent, re-running after migration succeeds is a no-op (the env
 # file already has the keys; the new plist already has no secrets).
 
 set -euo pipefail
@@ -21,17 +21,17 @@ ENV_FILE="$HOME/.config/ocean-bot/env"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 if [ ! -f "$PLIST" ]; then
-  echo "no legacy plist at $PLIST — nothing to migrate. Run install-launchd.sh directly after creating $ENV_FILE." >&2
+  echo "no legacy plist at $PLIST, nothing to migrate. Run install-launchd.sh directly after creating $ENV_FILE." >&2
   exit 1
 fi
 
-# Use `defaults` (macOS) to read the plist as a structured dict —
+# Use `defaults` (macOS) to read the plist as a structured dict,
 # safer than grep. EnvironmentVariables is a dict; defaults will print
 # it as a property-list string we can parse.
 ENV_DICT="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$PLIST" 2>/dev/null || true)"
 
 if [ -z "$ENV_DICT" ]; then
-  echo "no EnvironmentVariables in $PLIST — nothing to migrate. Create $ENV_FILE manually per README." >&2
+  echo "no EnvironmentVariables in $PLIST, nothing to migrate. Create $ENV_FILE manually per README." >&2
   exit 1
 fi
 
@@ -55,7 +55,7 @@ while IFS= read -r line; do
   value="$(echo "$line" | sed -nE 's/^[[:space:]]+[A-Z_][A-Z0-9_]*[[:space:]]*=[[:space:]]*(.*)$/\1/p')"
   if [ -z "$key" ]; then continue; fi
   case "$key" in
-    PATH|HOME) continue ;;  # bootstrap — stays in plist via installer
+    PATH|HOME) continue ;;  # bootstrap, stays in plist via installer
   esac
   # Append-or-update in $ENV_FILE (idempotent).
   if grep -q "^${key}=" "$ENV_FILE"; then
@@ -71,11 +71,11 @@ $ENV_DICT
 EOF
 
 if [ "$MIGRATED" = "0" ]; then
-  echo "nothing to migrate — plist EnvironmentVariables already contains only bootstrap keys (PATH/HOME)."
+  echo "nothing to migrate, plist EnvironmentVariables already contains only bootstrap keys (PATH/HOME)."
   if [ -f "$ENV_FILE" ]; then
     echo "✓ env file present at $ENV_FILE (mode $(stat -f '%A' "$ENV_FILE" 2>/dev/null || stat -c '%a' "$ENV_FILE"))."
   else
-    echo "WARNING: $ENV_FILE missing — bot will fail to boot. Re-create it per tools/ocean-bot/README.md." >&2
+    echo "WARNING: $ENV_FILE missing, bot will fail to boot. Re-create it per tools/ocean-bot/README.md." >&2
     exit 1
   fi
   exit 0
@@ -89,7 +89,7 @@ echo "re-running installer to rewrite plist without secrets…"
 echo ""
 echo "verifying plist no longer contains secrets…"
 # Read the actual EnvironmentVariables dict via PlistBuddy (structured)
-# instead of grepping the raw XML — grep'ing for "secret" matched the
+# instead of grepping the raw XML, grep'ing for "secret" matched the
 # installer's HEADER COMMENTS that explain the security rationale, not
 # the values. The dict is the only place secrets could survive.
 PLIST_ENV="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables" "$PLIST" 2>/dev/null || true)"
@@ -104,7 +104,7 @@ else
 fi
 
 echo ""
-echo "next: rotate the Neon password — the prior value is in this"
+echo "next: rotate the Neon password, the prior value is in this"
 echo "session's transcript + the unredacted plist on disk before migration."
 echo "  1. https://console.neon.tech → project → Settings → Reset password"
 echo "  2. update OCEAN_BOT_DATABASE_URL= in $ENV_FILE with the new URL"

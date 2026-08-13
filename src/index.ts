@@ -48,6 +48,7 @@ import {
   classifyNoopRun,
   DEFAULT_MAX_TOOL_USES,
   pickResumeSessionId,
+  ensureBacklogIdFooter,
 } from "./runner.js";
 import {
   createRun,
@@ -84,7 +85,7 @@ import {
   pushToTarget,
 } from "./push.js";
 import { maybeRunPhantomCleanup } from "./phantom-cleanup.js";
-import { runHealthSweep } from "./health-sweep.js";
+import { runHealthSweep, sweepOrphanRunningRunsOnBoot } from "./health-sweep.js";
 import { scoutTask, SCOUT_DESCRIPTION_THRESHOLD } from "./scout.js";
 import {
   resolveScoutScope,
@@ -184,6 +185,26 @@ async function main(): Promise<void> {
     projects: cfg.projects.filter((p) => p.enabled).map((p) => p.name),
     dryRun,
   });
+
+  // Boot-time orphan sweep: force-close any run rows still in
+  // status='running' from a prior bot process that died without
+  // updating its final state (SIGKILL, OOM, OS sleep, or DB-write-
+  // after-process-died race). Threshold is 0.1h (~6 min) so this
+  // can't ever catch a live in-flight tick from a concurrent process.
+  // Defense for the 2026-05-28 phantom that sat 13h in `running` from
+  // an overnight laptop sleep; per-tick sweep's 2h threshold would
+  // eventually catch it but the operator shouldn't see day-old
+  // phantoms in the meantime. Best-effort: doesn't crash boot on db
+  // failure.
+  if (!dryRun) {
+    const orphans = await sweepOrphanRunningRunsOnBoot();
+    if (orphans.fixedCount > 0) {
+      log.info("ocean-bot.boot.orphan_runs_cleared", {
+        count: orphans.fixedCount,
+        ids: orphans.fixedIds,
+      });
+    }
+  }
 
   process.on("SIGTERM", () => {
     log.info("ocean-bot.sigterm, finishing current tick then exiting");
@@ -561,7 +582,7 @@ async function tick(
  * queue ships).
  *
  * Called from both ship paths: auto-push (executeRun) and approved-
- * shipped (pushApprovedRuns). Bit dotnet-* 2026-05-22 -> 2026-05-26.
+ * shipped (pushApprovedRuns). This bit us for 4 days in May 2026.
  */
 async function autoCloseReferencedBacklogItems(
   adapter: ProjectAdapter,
@@ -977,7 +998,7 @@ async function executeRun(
     return;
   }
 
-  const headAfter = await headSha(adapter.rootDir);
+  let headAfter = await headSha(adapter.rootDir);
   if (headAfter === baseSha) {
     // Two sub-cases on no-new-commit:
     //  - Clean tree: genuine no-op. Existing behavior (shipped+local).
@@ -1017,6 +1038,10 @@ async function executeRun(
     });
     return;
   }
+
+  // Ship-gate: if the committed message omits the backlog item id, amend.
+  // Scoped to backlog: taskId prefix; non-backlog runs are never touched.
+  headAfter = await ensureBacklogIdFooter(adapter.rootDir, headAfter, pick.taskId);
 
   const diff = await diffSinceCommit(adapter.rootDir, baseSha);
   await appendEvent(runId, "commit", {
@@ -1093,10 +1118,10 @@ async function executeRun(
     // message names any OPEN backlog item id (creative / refactor
     // ships often satisfy a backlog item incidentally), auto-close
     // those too. Skips the pick's own id (markBacklogItemDone handled
-    // it). Bit dotnet-* 2026-05-22 -> 2026-05-26 when the C# parser
-    // shipped via creative queue and 4 dotnet-* backlog items rotted
-    // open for 4 days. See memory/feedback_auth_trust_host_required.md
-    // (4th lesson) + journal.ts#closeBacklogItemsByIds.
+    // it). This bit us for 4 days in May 2026: a large parser feature
+    // shipped through the creative queue and the 4 backlog items it
+    // satisfied all rotted open, because only `backlog:`-prefixed picks
+    // were ever closed. See journal.ts#closeBacklogItemsByIds.
     await autoCloseReferencedBacklogItems(
       adapter,
       runId,
@@ -1142,7 +1167,7 @@ async function pushApprovedRuns(adapter: ProjectAdapter): Promise<void> {
       if (!reachable) {
         await setRunFields(run.id, {
           status: "failed",
-          blocker: `approved commit ${run.commitSha.slice(0, 7)} no longer reachable from ${run.branch} — branch was rebased / reset since approval`,
+          blocker: `approved commit ${run.commitSha.slice(0, 7)} no longer reachable from ${run.branch}, branch was rebased / reset since approval`,
           endedAt: new Date(),
         });
         log.warn("approved.commit_unreachable", {

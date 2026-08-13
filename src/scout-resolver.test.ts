@@ -429,7 +429,7 @@ describe("resolveScoutScope", () => {
 
   it("returns an escalate verdict on pricing-decision warnings", async () => {
     const r = await resolveScoutScope({
-      description: "Decide new founder-tier price",
+      description: "Decide new subscription tier price",
       scopeWarnings: ["pricing decision requires operator input"],
       cwd: "/tmp",
       spawnFn: mkSpawn(

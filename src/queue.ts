@@ -108,7 +108,7 @@ export interface PickNextInputs {
   excludeTaskIdsByProject?: Map<string, Set<string>>;
   /** Whole projects to skip this tick (e.g., over per-project budget
    *  sub-cap). When a project is excluded, its adapter is not consulted
-   *  at all — the picker falls through to other projects. */
+   *  at all, the picker falls through to other projects. */
   excludeProjects?: Set<string>;
 }
 

@@ -40,7 +40,7 @@ if [ ! -f "$DIST_ENTRY" ]; then
 fi
 
 # Env-file presence + permission check. Fail closed if the operator
-# hasn't set up the sidecar correctly — we'd rather block install than
+# hasn't set up the sidecar correctly, we'd rather block install than
 # silently launch the bot with no credentials (it would just
 # crashloop, but the failure mode is opaque).
 if [ ! -f "$ENV_FILE" ]; then
@@ -55,7 +55,7 @@ Create it before re-running this installer:
   #   OCEAN_BOT_DATABASE_URL=postgresql://...
   # see tools/ocean-bot/README.md for the full slot list.
 
-Never commit this file to git — it holds prod credentials.
+Never commit this file to git, it holds prod credentials.
 EOF
   exit 1
 fi
@@ -117,7 +117,7 @@ EOF
 
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
-echo "installed $LABEL — logs at $LOG_DIR/ocean-bot.{log,err}"
+echo "installed $LABEL, logs at $LOG_DIR/ocean-bot.{log,err}"
 echo "env file: $ENV_FILE (mode 600)"
 echo "tail -f $LOG_DIR/ocean-bot.log to watch it run"
 

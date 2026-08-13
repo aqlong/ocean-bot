@@ -82,7 +82,7 @@ const DEFAULT_DENYLIST_PATTERNS = [
 // case (c2w product code reads it for real-LLM extraction). The bot's
 // own attribution stamp (OCEAN_BOT_RUN_ID) is passed in explicitly by
 // the runner, no need to allowlist.
-const DEFAULT_ALLOWLIST_KEYS = ["ANTHROPIC_API_KEY"];
+const DEFAULT_ALLOWLIST_KEYS = ["ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY"];
 
 export interface SafeEnvOptions {
   /** Extra keys to drop, in addition to the defaults. */

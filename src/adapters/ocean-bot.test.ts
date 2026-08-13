@@ -424,3 +424,80 @@ describe("OceanBotAdapter, push + preflight + visual + classifier", () => {
     }
   });
 });
+
+describe("OceanBotAdapter, backlog appendix in refactor()", () => {
+  async function mkRepoWithBotRefactorCommit(rootDir: string): Promise<void> {
+    await commitFiles(
+      rootDir,
+      [
+        { path: "tools/ocean-bot/src/a.ts", content: "export const a = 1;\n" },
+        { path: "tools/ocean-bot/src/b.ts", content: "export const b = 1;\n" },
+        { path: "tools/ocean-bot/src/c.ts", content: "export const c = 1;\n" },
+      ],
+      "bot: big refactor",
+    );
+  }
+
+  it("appendix present when open ids exist", async () => {
+    const repo = await mkRepo();
+    try {
+      await mkRepoWithBotRefactorCommit(repo);
+      const a = new OceanBotAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        listOpenBacklogIds: async () => [
+          { id: "fix-scout-timeout", title: "Fix scout timeout on slow Claude" },
+          { id: "health-sweep-stuck", title: "Health sweep stuck loop fix" },
+        ],
+      });
+      const cands = await a.refactor();
+      expect(cands).toHaveLength(1);
+      expect(cands[0]!.summary).toMatch(/Currently open backlog items:/);
+      expect(cands[0]!.summary).toMatch(/fix-scout-timeout: Fix scout timeout on slow Claude/);
+      expect(cands[0]!.summary).toMatch(/health-sweep-stuck: Health sweep stuck loop fix/);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("appendix absent when list is empty", async () => {
+    const repo = await mkRepo();
+    try {
+      await mkRepoWithBotRefactorCommit(repo);
+      const a = new OceanBotAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        listOpenBacklogIds: async () => [],
+      });
+      const cands = await a.refactor();
+      expect(cands).toHaveLength(1);
+      expect(cands[0]!.summary).not.toMatch(/Currently open backlog items:/);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("list truncated to 20 when stub returns more", async () => {
+    const repo = await mkRepo();
+    try {
+      await mkRepoWithBotRefactorCommit(repo);
+      const items = Array.from({ length: 25 }, (_, i) => ({
+        id: `item-${i}`,
+        title: `Task ${i}`,
+      }));
+      const a = new OceanBotAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        listOpenBacklogIds: async () => items,
+      });
+      const cands = await a.refactor();
+      expect(cands).toHaveLength(1);
+      const bulletLines = cands[0]!.summary
+        .split("\n")
+        .filter((l) => /^- item-\d+:/.test(l));
+      expect(bulletLines).toHaveLength(20);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+});

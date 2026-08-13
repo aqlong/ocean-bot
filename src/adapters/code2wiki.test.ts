@@ -17,11 +17,16 @@ async function mkRepo(): Promise<string> {
   return repo;
 }
 
-function mkAdapter(rootDir: string, opts: { lastCreativeAuditAt?: number } = {}) {
+function mkAdapter(
+  rootDir: string,
+  opts: { hasRecentCreativeRun?: () => Promise<boolean> } = {},
+) {
   return new Code2wikiAdapter({
     rootDir,
     memoryDir: path.join(rootDir, "memory"),
-    lastCreativeAuditAt: opts.lastCreativeAuditAt,
+    // Default to "no recent creative run" so creative() yields a candidate
+    // in unit tests without touching the DB. Throttle tests inject true.
+    hasRecentCreativeRun: opts.hasRecentCreativeRun ?? (async () => false),
   });
 }
 
@@ -312,7 +317,7 @@ describe("Code2wikiAdapter, CLAUDE.md section hints", () => {
   it("creative queue (category=other) omits the hint prefix", async () => {
     const repo = await mkRepo();
     try {
-      const cands = await mkAdapter(repo, { lastCreativeAuditAt: 0 }).creative();
+      const cands = await mkAdapter(repo).creative();
       expect(cands).toHaveLength(1);
       expect(cands[0]!.summary).not.toMatch(/^CLAUDE\.md sections most relevant/);
     } finally {
@@ -585,8 +590,8 @@ describe("Code2wikiAdapter, roadmap", () => {
       await fs.writeFile(
         path.join(repo, "docs", "roadmap.md"),
         [
-          "- [ ] Land at $495 MRR baseline by week 5 <!-- bot: operator-only -->",
-          "- [ ] Onboard 5 at $99/mo founder-tier <!-- bot: operator-only -->",
+          "- [ ] Hit the quarterly revenue target <!-- bot: operator-only -->",
+          "- [ ] Onboard the first five paying accounts <!-- bot: operator-only -->",
           "- [ ] Implement Notion publisher",
         ].join("\n"),
       );
@@ -906,7 +911,9 @@ describe("Code2wikiAdapter, creative", () => {
   it("returns a creative-audit candidate when no recent audit", async () => {
     const repo = await mkRepo();
     try {
-      const cands = await mkAdapter(repo, { lastCreativeAuditAt: 0 }).creative();
+      const cands = await mkAdapter(repo, {
+        hasRecentCreativeRun: async () => false,
+      }).creative();
       expect(cands).toHaveLength(1);
       expect(cands[0]?.queue).toBe("creative");
     } finally {
@@ -914,12 +921,153 @@ describe("Code2wikiAdapter, creative", () => {
     }
   });
 
-  it("returns empty when last audit was < 24h ago", async () => {
+  it("returns empty when a creative run already happened in the last 24h", async () => {
     const repo = await mkRepo();
     try {
-      const recent = Date.now() - 60 * 1000;
-      const cands = await mkAdapter(repo, { lastCreativeAuditAt: recent }).creative();
+      const cands = await mkAdapter(repo, {
+        hasRecentCreativeRun: async () => true,
+      }).creative();
       expect(cands).toEqual([]);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Code2wikiAdapter, backlog appendix in creative()", () => {
+  it("appendix present when open ids exist", async () => {
+    const repo = await mkRepo();
+    try {
+      const a = new Code2wikiAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        hasRecentCreativeRun: async () => false,
+        listOpenBacklogIds: async () => [
+          { id: "fix-parser-cfml", title: "Fix CFML parser edge case" },
+          { id: "add-notion-support", title: "Add Notion support" },
+        ],
+      });
+      const cands = await a.creative();
+      expect(cands).toHaveLength(1);
+      expect(cands[0]!.summary).toMatch(/Currently open backlog items:/);
+      expect(cands[0]!.summary).toMatch(/fix-parser-cfml: Fix CFML parser edge case/);
+      expect(cands[0]!.summary).toMatch(/add-notion-support: Add Notion support/);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("appendix absent when list is empty", async () => {
+    const repo = await mkRepo();
+    try {
+      const a = new Code2wikiAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        hasRecentCreativeRun: async () => false,
+        listOpenBacklogIds: async () => [],
+      });
+      const cands = await a.creative();
+      expect(cands).toHaveLength(1);
+      expect(cands[0]!.summary).not.toMatch(/Currently open backlog items:/);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("list truncated to 20 when stub returns more", async () => {
+    const repo = await mkRepo();
+    try {
+      const items = Array.from({ length: 25 }, (_, i) => ({
+        id: `item-${i}`,
+        title: `Task ${i}`,
+      }));
+      const a = new Code2wikiAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        hasRecentCreativeRun: async () => false,
+        listOpenBacklogIds: async () => items,
+      });
+      const cands = await a.creative();
+      expect(cands).toHaveLength(1);
+      const bulletLines = cands[0]!.summary
+        .split("\n")
+        .filter((l) => /^- item-\d+:/.test(l));
+      expect(bulletLines).toHaveLength(20);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Code2wikiAdapter, backlog appendix in refactor()", () => {
+  async function mkRepoWithC2wRefactorCommit(rootDir: string): Promise<void> {
+    // 3 non-ocean-bot .ts files satisfy the refactor() eligibility filter:
+    //   !isOceanBotOnly(c.files) && c.files.filter(f => f.endsWith(".ts")).length >= 3
+    await fs.writeFile(path.join(rootDir, "a.ts"), "export const a = 1;\n");
+    await fs.writeFile(path.join(rootDir, "b.ts"), "export const b = 1;\n");
+    await fs.writeFile(path.join(rootDir, "c.ts"), "export const c = 1;\n");
+    await git(rootDir, ["add", "."]);
+    await git(rootDir, ["commit", "-q", "-m", "c2w refactor"]);
+  }
+
+  it("appendix present when open ids exist", async () => {
+    const repo = await mkRepo();
+    try {
+      await mkRepoWithC2wRefactorCommit(repo);
+      const a = new Code2wikiAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        listOpenBacklogIds: async () => [
+          { id: "fix-parser-cfml", title: "Fix CFML parser edge case" },
+          { id: "add-notion-support", title: "Add Notion support" },
+        ],
+      });
+      const cands = await a.refactor();
+      expect(cands).toHaveLength(1);
+      expect(cands[0]!.summary).toMatch(/Currently open backlog items:/);
+      expect(cands[0]!.summary).toMatch(/fix-parser-cfml: Fix CFML parser edge case/);
+      expect(cands[0]!.summary).toMatch(/add-notion-support: Add Notion support/);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("appendix absent when list is empty", async () => {
+    const repo = await mkRepo();
+    try {
+      await mkRepoWithC2wRefactorCommit(repo);
+      const a = new Code2wikiAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        listOpenBacklogIds: async () => [],
+      });
+      const cands = await a.refactor();
+      expect(cands).toHaveLength(1);
+      expect(cands[0]!.summary).not.toMatch(/Currently open backlog items:/);
+    } finally {
+      await fs.rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("list truncated to 20 when stub returns more", async () => {
+    const repo = await mkRepo();
+    try {
+      await mkRepoWithC2wRefactorCommit(repo);
+      const items = Array.from({ length: 25 }, (_, i) => ({
+        id: `item-${i}`,
+        title: `Task ${i}`,
+      }));
+      const a = new Code2wikiAdapter({
+        rootDir: repo,
+        memoryDir: path.join(repo, "memory"),
+        listOpenBacklogIds: async () => items,
+      });
+      const cands = await a.refactor();
+      expect(cands).toHaveLength(1);
+      const bulletLines = cands[0]!.summary
+        .split("\n")
+        .filter((l) => /^- item-\d+:/.test(l));
+      expect(bulletLines).toHaveLength(20);
     } finally {
       await fs.rm(repo, { recursive: true, force: true });
     }

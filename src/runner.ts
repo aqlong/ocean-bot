@@ -14,8 +14,9 @@ import * as path from "node:path";
 import { log } from "./util/log.js";
 import { appendBotSession } from "./budget.js";
 import { appendEvent, getState, setState } from "./journal.js";
-import { isClean, stashUncommittedToRef } from "./util/git.js";
+import { isClean, stashUncommittedToRef, git, commitMessage } from "./util/git.js";
 import { buildSafeChildEnv } from "./util/safe-env.js";
+import { isBacklogIdReferenced } from "./util/backlog-id-match.js";
 
 export interface RunnerInputs {
   runId: string;
@@ -658,4 +659,45 @@ export async function releaseLock(dataDir: string): Promise<void> {
   } catch {
     // ignore
   }
+}
+
+/**
+ * Ship-gate for bot/backlog runs. If the HEAD commit message omits the
+ * backlog item id as a whole token, amends the commit to append a
+ * "Closes backlog item: <id>" footer.
+ *
+ * Scoped to taskId strings starting with "backlog:" so operator commits
+ * and non-backlog bot runs are never touched.
+ *
+ * Returns the new HEAD SHA after amendment, or the original sha when no
+ * amendment was needed or on any git failure (best-effort, never throws).
+ */
+export async function ensureBacklogIdFooter(
+  cwd: string,
+  currentSha: string,
+  taskId: string | null | undefined,
+): Promise<string> {
+  if (!taskId?.startsWith("backlog:")) return currentSha;
+  const backlogId = taskId.slice("backlog:".length);
+  if (!backlogId) return currentSha;
+  const msg = await commitMessage(cwd, currentSha);
+  if (isBacklogIdReferenced(msg, backlogId)) return currentSha;
+  const newMsg = `${msg.trimEnd()}\n\nCloses backlog item: ${backlogId}`;
+  const r = await git(cwd, ["commit", "--amend", "-m", newMsg]);
+  if (r.code !== 0) {
+    log.warn("runner.ensureBacklogIdFooter.amend_failed", {
+      taskId,
+      backlogId,
+      stderr: r.stderr.slice(0, 200),
+    });
+    return currentSha;
+  }
+  const newSha = (await git(cwd, ["rev-parse", "HEAD"])).stdout.trim();
+  log.info("runner.ensureBacklogIdFooter.amended", {
+    taskId,
+    backlogId,
+    oldSha: currentSha.slice(0, 8),
+    newSha: newSha.slice(0, 8),
+  });
+  return newSha;
 }

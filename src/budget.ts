@@ -36,7 +36,7 @@ export interface BudgetCaps {
    *  Default 0.9, back off when within 10% of cap. */
   warnRatio: number;
   /** Optional per-project sub-caps. When absent (the v1 case), behavior
-   *  is identical to the single-pool gate — `decideProjectBudgets`
+   *  is identical to the single-pool gate, `decideProjectBudgets`
    *  returns an empty map and the picker exclude-list is empty.
    *
    *  Overlapping shares (e.g., 0.6 + 0.6) are intentional: each
@@ -52,7 +52,7 @@ export interface BudgetCaps {
 
 export interface ProjectShare {
   /** Fraction of each global cap this project may consume. 0..1.
-   *  Values > 1 are NOT clamped — operator can pin a project to a
+   *  Values > 1 are NOT clamped, operator can pin a project to a
    *  larger-than-global cap as an explicit "this project is allowed to
    *  exceed the pool" override (useful pre-rebalance). */
   share: number;
@@ -354,7 +354,7 @@ export interface DecideProjectBudgetsInput {
 /**
  * Compute a per-project gate for each project with a `perProject`
  * sub-cap configured. Returns an empty map when `caps.perProject` is
- * undefined (graceful fallback — behavior identical to today's single
+ * undefined (graceful fallback, behavior identical to today's single
  * pool). Projects configured in `perProject` but absent from
  * `rowsByProject` still get a gate row with zero usage (so the
  * dashboard can render their bars at 0%).

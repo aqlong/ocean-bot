@@ -13,7 +13,7 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, gte } from "drizzle-orm";
 import { getDb, schema } from "../db/index.js";
 import { log } from "../util/log.js";
 import { applyRules, type ClassifierConfig } from "../classifier.js";
@@ -45,8 +45,13 @@ export interface Code2wikiAdapterOptions {
   memoryDir: string;
   /** Optional override of the classifier config. */
   classifierConfig?: ClassifierConfig;
-  /** When was the last creative-audit task issued (unix ms)? */
-  lastCreativeAuditAt?: number;
+  /** Injectable override for the once-per-day creative throttle (used in
+   *  unit tests). Returns true when a creative run already happened inside
+   *  the lookback window, in which case creative() yields no candidate.
+   *  Production omits this and uses the DB-backed default. */
+  hasRecentCreativeRun?: () => Promise<boolean>;
+  /** Injectable override for open-backlog-id queries (used in unit tests). */
+  listOpenBacklogIds?: (project: string) => Promise<Array<{id: string; title: string}>>;
 }
 
 const DEFAULT_CLASSIFIER_CONFIG: ClassifierConfig = {
@@ -132,7 +137,8 @@ export class Code2wikiAdapter implements ProjectAdapter {
   readonly memoryDir: string;
   readonly visualInspectConfig: VisualInspectConfig;
   private readonly classifier: ClassifierConfig;
-  private readonly lastCreativeAuditAt: number;
+  private readonly hasRecentCreativeRunFn: () => Promise<boolean>;
+  private readonly listOpenBacklogIdsFn: (project: string) => Promise<Array<{id: string; title: string}>>;
   /** Process-memory preflight cache, keyed by HEAD SHA. Cleared when
    *  bot restarts. Cheap: a clean tree means one cached "no failures"
    *  result re-used until the SHA changes. */
@@ -149,7 +155,9 @@ export class Code2wikiAdapter implements ProjectAdapter {
       fallbackRoutes: ["/dashboard"],
     };
     this.classifier = opts.classifierConfig ?? DEFAULT_CLASSIFIER_CONFIG;
-    this.lastCreativeAuditAt = opts.lastCreativeAuditAt ?? 0;
+    this.hasRecentCreativeRunFn =
+      opts.hasRecentCreativeRun ?? defaultHasRecentCreativeRun;
+    this.listOpenBacklogIdsFn = opts.listOpenBacklogIds ?? defaultListOpenBacklogIds;
   }
 
   // ---- Queues ----
@@ -379,34 +387,43 @@ export class Code2wikiAdapter implements ProjectAdapter {
   }
 
   async refactor(): Promise<TaskCandidate[]> {
-    const out: TaskCandidate[] = [];
     const recent = await recentCommitShasAndFiles(this.rootDir, 2);
-    for (const c of recent) {
-      // Mirror the gapClosure ownership filter: ocean-bot-only commits
-      // are surfaced by the ocean-bot adapter's refactor() instead.
-      if (isOceanBotOnly(c.files)) continue;
-      const big = c.files.filter((f) => f.endsWith(".ts")).length;
-      if (big >= 3) {
-        out.push({
-          summary: withHint(QUEUE_CATEGORY.refactor, [
-            `Deep-self-review pass on commit ${c.sha.slice(0, 7)} (${c.files.length} files)`,
-          ]),
-          leverage: 25,
-          estTokens: 20_000,
-          queue: "refactor",
-          taskId: `refactor:${c.sha}`,
-        });
-      }
-    }
-    return out;
+    // Mirror the gapClosure ownership filter: ocean-bot-only commits
+    // are surfaced by the ocean-bot adapter's refactor() instead.
+    const eligible = recent.filter(
+      (c) => !isOceanBotOnly(c.files) && c.files.filter((f) => f.endsWith(".ts")).length >= 3,
+    );
+    if (eligible.length === 0) return [];
+    const backlogItems = await this.listOpenBacklogIdsFn(this.name);
+    const appendix = buildBacklogAppendix(backlogItems);
+    return eligible.map((c) => ({
+      summary: withHint(QUEUE_CATEGORY.refactor, [
+        `Deep-self-review pass on commit ${c.sha.slice(0, 7)} (${c.files.length} files)`,
+        ...appendix,
+      ]),
+      leverage: 25,
+      estTokens: 20_000,
+      queue: "refactor" as const,
+      taskId: `refactor:${c.sha}`,
+    }));
   }
 
   async creative(): Promise<TaskCandidate[]> {
-    if (Date.now() - this.lastCreativeAuditAt < ONE_DAY_MS) return [];
+    // Throttle: at most one creative-improvement audit per 24h. The prior
+    // in-memory `lastCreativeAuditAt` check never engaged in production (the
+    // adapter is constructed without that option, so it defaulted to 0, and
+    // the field was readonly + never updated) -> creative ran every tick and
+    // shipped 10-88 churn commits/day (e.g. creative:20597 ran 88x on
+    // 2026-05-24). The throttle now reads the runs table: if any creative
+    // run started in the last 24h, yield nothing.
+    if (await this.hasRecentCreativeRunFn()) return [];
+    const backlogItems = await this.listOpenBacklogIdsFn(this.name);
+    const appendix = buildBacklogAppendix(backlogItems);
     return [
       {
         summary: withHint(QUEUE_CATEGORY.creative, [
           "Creative-improvement audit: read CLAUDE.md, scan recent commits, propose ONE small high-leverage improvement and ship it",
+          ...appendix,
         ]),
         leverage: 15,
         estTokens: 35_000,
@@ -632,4 +649,65 @@ function hashish(s: string): string {
     h = (h * 31 + s.charCodeAt(i)) | 0;
   }
   return Math.abs(h).toString(36);
+}
+
+const MAX_BACKLOG_IDS = 20;
+
+/** Builds the appendix lines for open backlog items. Returns [] when the
+ *  list is empty so callers can spread without adding blank lines. */
+function buildBacklogAppendix(
+  items: Array<{id: string; title: string}>,
+): string[] {
+  if (items.length === 0) return [];
+  const capped = items.slice(0, MAX_BACKLOG_IDS);
+  const lines: string[] = ["", "Currently open backlog items:"];
+  for (const item of capped) {
+    lines.push(`- ${item.id}: ${item.title}`);
+  }
+  return lines;
+}
+
+async function defaultListOpenBacklogIds(
+  project: string,
+): Promise<Array<{id: string; title: string}>> {
+  try {
+    return await getDb()
+      .select({ id: schema.oceanBotBacklogItem.id, title: schema.oceanBotBacklogItem.title })
+      .from(schema.oceanBotBacklogItem)
+      .where(
+        and(
+          eq(schema.oceanBotBacklogItem.project, project),
+          eq(schema.oceanBotBacklogItem.status, "open"),
+        ),
+      )
+      .orderBy(asc(schema.oceanBotBacklogItem.priority))
+      .limit(MAX_BACKLOG_IDS);
+  } catch {
+    return [];
+  }
+}
+
+/** Default once-per-day creative throttle: has any creative-queue run
+ *  started in the last 24h? Reading the runs table (rather than in-memory
+ *  state) makes the throttle survive process restarts and the per-tick
+ *  adapter reconstruction that defeated the old `lastCreativeAuditAt`
+ *  field. Fail-safe: on any DB error return true (skip creative) so a
+ *  transient failure can never reopen the every-tick loop this replaced. */
+async function defaultHasRecentCreativeRun(): Promise<boolean> {
+  try {
+    const cutoff = new Date(Date.now() - ONE_DAY_MS);
+    const rows = await getDb()
+      .select({ id: schema.oceanBotRun.id })
+      .from(schema.oceanBotRun)
+      .where(
+        and(
+          eq(schema.oceanBotRun.queue, "creative"),
+          gte(schema.oceanBotRun.startedAt, cutoff),
+        ),
+      )
+      .limit(1);
+    return rows.length > 0;
+  } catch {
+    return true;
+  }
 }

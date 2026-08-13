@@ -32,6 +32,16 @@ NODE="${NODE:-/opt/homebrew/bin/node}"
 ENVFILE="${ENVFILE:-$HOME/.config/ocean-bot/env}"
 LOG="${LOG:-$HOME/Library/Logs/ocean-bot.log}"
 
+# ---------------------------------------------------------------------------
+# Benign auto-generated files that the build toolchain re-creates on every
+# run. The launch wrapper auto-stashes these before git pull and restores
+# them after. Extend by adding explicit filenames only; no glob patterns.
+# ---------------------------------------------------------------------------
+BENIGN_FILES=(
+  "apps/dashboard/next-env.d.ts"
+  "apps/dashboard/tsconfig.json"
+)
+
 # Emit a JSONL line that matches the format the bot writes itself.
 log() {
   local level="$1"
@@ -70,11 +80,51 @@ if [ "$CURRENT_BRANCH" != "main" ]; then
   fi
 fi
 
-# Step 3: fast-forward pull. Skip if tree is dirty (don't clobber operator WIP).
-DIRTY=$(git -C "$REPO" status --porcelain 2>/dev/null | head -c 1)
-if [ -n "$DIRTY" ]; then
-  log warn "dirty_tree" "skipping pull; operator should resolve"
+# Step 3: fast-forward pull.
+# If the tree is dirty, classify every dirty file:
+#   - ALL benign: stash them, pull, pop the stash on success.
+#   - ANY non-benign: skip pull (preserve operator WIP), same as before.
+# If pop fails, abort with a clear recovery message and leave the stash.
+DO_PULL=0
+STASH_MSG=""
+DIRTY_PORCELAIN=$(git -C "$REPO" status --porcelain 2>/dev/null)
+
+if [ -z "$DIRTY_PORCELAIN" ]; then
+  DO_PULL=1
 else
+  ALL_BENIGN=1
+  STASH_TARGETS=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    FNAME="${line:3}"
+    IS_BENIGN=0
+    for b in "${BENIGN_FILES[@]}"; do
+      if [ "$FNAME" = "$b" ]; then
+        IS_BENIGN=1
+        STASH_TARGETS+=("$FNAME")
+        break
+      fi
+    done
+    if [ "$IS_BENIGN" = "0" ]; then
+      ALL_BENIGN=0
+      break
+    fi
+  done <<< "$DIRTY_PORCELAIN"
+
+  if [ "$ALL_BENIGN" = "0" ]; then
+    log warn "dirty_tree" "skipping pull; operator should resolve"
+  else
+    STASH_MSG="ocean-bot-launch-benign-$(date +%s)"
+    log info "benign_stash_start" "$STASH_MSG"
+    if git -C "$REPO" stash push -m "$STASH_MSG" -- "${STASH_TARGETS[@]}" >>"$LOG" 2>&1; then
+      DO_PULL=1
+    else
+      log warn "benign_stash_failed" "skipping pull"
+    fi
+  fi
+fi
+
+if [ "$DO_PULL" = "1" ]; then
   if ! git -C "$REPO" pull --ff-only --quiet origin main 2>/dev/null; then
     # Couldn't fast-forward. Either offline (acceptable) or diverged (bad).
     # --verify -q is critical: without it, `git rev-parse origin/main` on
@@ -87,10 +137,21 @@ else
     elif [ "$REMOTE_SHA" = "unknown" ]; then
       log warn "offline" "proceeding with local main"
     else
+      # Pop stash before exiting so the operator sees the real tree state.
+      [ -n "$STASH_MSG" ] && git -C "$REPO" stash pop >>"$LOG" 2>&1 || true
       log error "diverged" "local=$LOCAL_SHA remote=$REMOTE_SHA"
       exit 2
     fi
   fi
+fi
+
+if [ -n "$STASH_MSG" ]; then
+  if ! git -C "$REPO" stash pop >>"$LOG" 2>&1; then
+    log error "benign_stash_pop_failed" \
+      "stash '$STASH_MSG' left intact -- recover with: git -C $REPO stash pop"
+    exit 2
+  fi
+  log info "benign_stash_restored" "$STASH_MSG"
 fi
 
 # Step 4: rebuild dist if any src file is newer than dist/index.js.

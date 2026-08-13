@@ -413,7 +413,7 @@ async function seedBacklog(id: string, project = "code2wiki"): Promise<void> {
 }
 
 const ORPHAN_BLOCKER = (sha: string, branch = "main"): string =>
-  `approved commit ${sha} no longer reachable from ${branch} — branch was rebased / reset since approval`;
+  `approved commit ${sha} no longer reachable from ${branch}, branch was rebased / reset since approval`;
 
 D("journal, countOrphanFailuresForTaskId / blockBacklogItemForOrphanRetries", () => {
   beforeEach(truncateBacklog);

@@ -233,7 +233,7 @@ describe("visual-inspect.VisualInspectLoop.computePixelDiff", () => {
     fs.writeFileSync(bFile, PNG.sync.write(png));
 
     const { percent } = freshLoop().computePixelDiff(a, bFile);
-    // ~1% diff — below 5% default threshold
+    // ~1% diff, below 5% default threshold
     expect(percent).toBeGreaterThan(0);
     expect(percent).toBeLessThan(0.05);
   });

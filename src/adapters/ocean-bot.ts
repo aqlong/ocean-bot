@@ -58,6 +58,8 @@ export interface OceanBotAdapterOptions {
   memoryDir: string;
   /** Optional override of the classifier config. */
   classifierConfig?: ClassifierConfig;
+  /** Injectable override for open-backlog-id queries (used in unit tests). */
+  listOpenBacklogIds?: (project: string) => Promise<Array<{id: string; title: string}>>;
 }
 
 const DEFAULT_CLASSIFIER_CONFIG: ClassifierConfig = {
@@ -152,6 +154,7 @@ export class OceanBotAdapter implements ProjectAdapter {
   readonly claudeMdPath: string;
   readonly memoryDir: string;
   private readonly classifier: ClassifierConfig;
+  private readonly listOpenBacklogIdsFn: (project: string) => Promise<Array<{id: string; title: string}>>;
   private preflightCache: PreflightCache | null = null;
 
   constructor(opts: OceanBotAdapterOptions) {
@@ -161,6 +164,7 @@ export class OceanBotAdapter implements ProjectAdapter {
     this.claudeMdPath = path.join(opts.rootDir, "CLAUDE.md");
     this.memoryDir = opts.memoryDir;
     this.classifier = opts.classifierConfig ?? DEFAULT_CLASSIFIER_CONFIG;
+    this.listOpenBacklogIdsFn = opts.listOpenBacklogIds ?? defaultListOpenBacklogIds;
   }
 
   // ---- Queues ----
@@ -323,24 +327,23 @@ export class OceanBotAdapter implements ProjectAdapter {
   }
 
   async refactor(): Promise<TaskCandidate[]> {
-    const out: TaskCandidate[] = [];
     const recent = await recentCommitShasAndFiles(this.rootDir, 2);
-    for (const c of recent) {
-      if (!isOceanBotOnly(c.files)) continue;
-      const big = c.files.filter((f) => f.endsWith(".ts")).length;
-      if (big >= 3) {
-        out.push({
-          summary: withHint(QUEUE_CATEGORY.refactor, [
-            `Deep-self-review pass on ocean-bot commit ${c.sha.slice(0, 7)} (${c.files.length} files)`,
-          ]),
-          leverage: 25,
-          estTokens: 20_000,
-          queue: "refactor",
-          taskId: `refactor:${c.sha}`,
-        });
-      }
-    }
-    return out;
+    const eligible = recent.filter(
+      (c) => isOceanBotOnly(c.files) && c.files.filter((f) => f.endsWith(".ts")).length >= 3,
+    );
+    if (eligible.length === 0) return [];
+    const backlogItems = await this.listOpenBacklogIdsFn(this.name);
+    const appendix = buildBacklogAppendix(backlogItems);
+    return eligible.map((c) => ({
+      summary: withHint(QUEUE_CATEGORY.refactor, [
+        `Deep-self-review pass on ocean-bot commit ${c.sha.slice(0, 7)} (${c.files.length} files)`,
+        ...appendix,
+      ]),
+      leverage: 25,
+      estTokens: 20_000,
+      queue: "refactor" as const,
+      taskId: `refactor:${c.sha}`,
+    }));
   }
 
   async creative(): Promise<TaskCandidate[]> {
@@ -556,4 +559,38 @@ function hashish(s: string): string {
     h = (h * 31 + s.charCodeAt(i)) | 0;
   }
   return Math.abs(h).toString(36);
+}
+
+const MAX_BACKLOG_IDS = 20;
+
+function buildBacklogAppendix(
+  items: Array<{id: string; title: string}>,
+): string[] {
+  if (items.length === 0) return [];
+  const capped = items.slice(0, MAX_BACKLOG_IDS);
+  const lines: string[] = ["", "Currently open backlog items:"];
+  for (const item of capped) {
+    lines.push(`- ${item.id}: ${item.title}`);
+  }
+  return lines;
+}
+
+async function defaultListOpenBacklogIds(
+  project: string,
+): Promise<Array<{id: string; title: string}>> {
+  try {
+    return await getDb()
+      .select({ id: schema.oceanBotBacklogItem.id, title: schema.oceanBotBacklogItem.title })
+      .from(schema.oceanBotBacklogItem)
+      .where(
+        and(
+          eq(schema.oceanBotBacklogItem.project, project),
+          eq(schema.oceanBotBacklogItem.status, "open"),
+        ),
+      )
+      .orderBy(asc(schema.oceanBotBacklogItem.priority))
+      .limit(MAX_BACKLOG_IDS);
+  } catch {
+    return [];
+  }
 }

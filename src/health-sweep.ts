@@ -93,11 +93,67 @@ const DEFAULT_NOOP_THRESHOLD = 3;
 const DEFAULT_PREFLIGHT_THRESHOLD = 3;
 const DEFAULT_LOOKBACK_HOURS = 7 * 24;
 const DEFAULT_APPROVED_STALE_HOURS = 72;
-/** Hold-fire window for phantom 'running' rows. The runner's inner
- *  ceiling is a 30-min process timeout; legitimate opus runs on a
- *  complex backlog item can run for tens of minutes. Anything past 24h
- *  is definitely a SIGKILL or DB-write-after-process-died race. */
-const DEFAULT_RUNNING_STALE_HOURS = 24;
+/** Hold-fire window for phantom 'running' rows in the per-tick sweep.
+ *  Tightened from 24h to 2h on 2026-05-28 after a 13h-old phantom sat
+ *  in `status='running'` overnight because the bot was SIGKILL'd
+ *  (likely via OS sleep) between claude finishing and executeRun's
+ *  terminal setRunFields call. The runner's inner ceiling is a 30-min
+ *  process timeout; the post-spawn pipeline (push, classify, mark-
+ *  done) adds another few minutes at the upper bound. 2h gives ~4x
+ *  headroom over the legitimate worst case while catching genuine
+ *  phantoms before the operator sees them on the dashboard. */
+const DEFAULT_RUNNING_STALE_HOURS = 2;
+
+/** Tighter threshold used at bot startup. By the time the bot has just
+ *  finished its boot sequence, ANY row still in `status='running'` is
+ *  by definition orphaned -- the previous bot process that owned it is
+ *  dead. 0.1h (~6 min) is well past the legitimate post-claude post-
+ *  processing window and equal to the default tick interval, so it
+ *  can't catch a live in-flight tick from another process. */
+export const STARTUP_ORPHAN_THRESHOLD_HOURS = 0.1;
+
+/** Boot-time orphan sweep. Called from main() BEFORE the first tick so
+ *  any phantom left behind by a SIGKILL'd / OOM'd / OS-sleep'd previous
+ *  bot process is force-closed immediately rather than waiting for the
+ *  2h per-tick threshold. Same DB mutation as sweepStalePhantomRunningRuns
+ *  but with a much smaller `maxHours` and a different blocker message so
+ *  the audit trail distinguishes "boot-time orphan" from "in-session
+ *  stale phantom". */
+export async function sweepOrphanRunningRunsOnBoot(): Promise<StalePhantomRunningResult> {
+  try {
+    const cutoff = new Date(
+      Date.now() - STARTUP_ORPHAN_THRESHOLD_HOURS * 60 * 60 * 1000,
+    );
+    const rows = await getDb()
+      .update(schema.oceanBotRun)
+      .set({
+        status: "failed",
+        endedAt: new Date(),
+        blocker: sql`COALESCE(${schema.oceanBotRun.blocker}, ${`auto-cleanup at boot: orphan running row from prior bot process (SIGKILL, OOM, OS sleep, or DB-write-after-process-died race); no terminal event recorded`})`,
+      })
+      .where(
+        and(
+          eq(schema.oceanBotRun.status, "running"),
+          sql`${schema.oceanBotRun.startedAt} < ${cutoff}`,
+        ),
+      )
+      .returning({ id: schema.oceanBotRun.id });
+    const fixedIds = rows.map((r) => r.id);
+    if (fixedIds.length > 0) {
+      log.warn("health_sweep.orphan_running_fixed_on_boot", {
+        count: fixedIds.length,
+        ids: fixedIds,
+        thresholdHours: STARTUP_ORPHAN_THRESHOLD_HOURS,
+      });
+    }
+    return { fixedCount: fixedIds.length, fixedIds };
+  } catch (e) {
+    log.error("health_sweep.sweepOrphanRunningRunsOnBoot failed", {
+      err: e instanceof Error ? e.message : String(e),
+    });
+    return { fixedCount: 0, fixedIds: [] };
+  }
+}
 
 /** AUTO-FIX: close backlog items that have a shipped run referencing
  *  them but somehow stayed status='open'. The query joins ocean_bot_run

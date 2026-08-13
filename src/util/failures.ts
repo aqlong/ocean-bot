@@ -93,7 +93,7 @@ export function summarizeFailures(
   for (const f of failures) {
     const block = `\n- [${f.kind}] ${f.label}\n  ${f.context.split("\n").join("\n  ")}\n`;
     if ((header + body + block).length > maxBytes) {
-      body += `\n(truncated — ${failures.length - countShown(body)} more)\n`;
+      body += `\n(truncated, ${failures.length - countShown(body)} more)\n`;
       break;
     }
     body += block;

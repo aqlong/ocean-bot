@@ -10,7 +10,7 @@ import { findReferencedBacklogIds } from "./journal.js";
 
 describe("findReferencedBacklogIds (kebab-case-id-safe match)", () => {
   it("returns [] for empty message", () => {
-    expect(findReferencedBacklogIds("", ["dotnet-2-add-dep"])).toEqual([]);
+    expect(findReferencedBacklogIds("", ["svc-2-add-dep"])).toEqual([]);
   });
 
   it("returns [] for empty id list", () => {
@@ -18,62 +18,62 @@ describe("findReferencedBacklogIds (kebab-case-id-safe match)", () => {
   });
 
   it("matches an id present in the message body", () => {
-    const msg = `feat(parser): ship the thing\n\nCloses dotnet-2-add-dep.`;
-    expect(findReferencedBacklogIds(msg, ["dotnet-2-add-dep"])).toEqual([
-      "dotnet-2-add-dep",
+    const msg = `feat(parser): ship the thing\n\nCloses svc-2-add-dep.`;
+    expect(findReferencedBacklogIds(msg, ["svc-2-add-dep"])).toEqual([
+      "svc-2-add-dep",
     ]);
   });
 
   it("matches multiple ids in one message", () => {
-    const msg = `Body references dotnet-2-add-dep and also dotnet-3-parser-mvc-webapi here.`;
+    const msg = `Body references svc-2-add-dep and also svc-3-parser-mvc-webapi here.`;
     const result = findReferencedBacklogIds(msg, [
-      "dotnet-2-add-dep",
-      "dotnet-3-parser-mvc-webapi",
-      "dotnet-9-end-to-end-smoke-fixture",
+      "svc-2-add-dep",
+      "svc-3-parser-mvc-webapi",
+      "svc-9-end-to-end-smoke-fixture",
     ]);
     expect(result.sort()).toEqual(
-      ["dotnet-2-add-dep", "dotnet-3-parser-mvc-webapi"].sort(),
+      ["svc-2-add-dep", "svc-3-parser-mvc-webapi"].sort(),
     );
   });
 
-  it("REJECTS substring match (dotnet-1 inside dotnet-10)", () => {
-    // This is the load-bearing case. The May 2026 dotnet-* series had
-    // ids dotnet-1, dotnet-2, ..., dotnet-10. A naive substring match
-    // would falsely close dotnet-1 whenever dotnet-10 appears in a
+  it("REJECTS substring match (svc-1 inside svc-10)", () => {
+    // This is the load-bearing case. The May 2026 svc-* series had
+    // ids svc-1, svc-2, ..., svc-10. A naive substring match
+    // would falsely close svc-1 whenever svc-10 appears in a
     // commit body. Explicit lookarounds in the regex prevent this.
-    const msg = `Closes dotnet-10 only.`;
-    expect(findReferencedBacklogIds(msg, ["dotnet-1", "dotnet-10"])).toEqual([
-      "dotnet-10",
+    const msg = `Closes svc-10 only.`;
+    expect(findReferencedBacklogIds(msg, ["svc-1", "svc-10"])).toEqual([
+      "svc-10",
     ]);
   });
 
   it("treats hyphen as part of the id (not a word boundary)", () => {
     // JS \b treats `-` as non-word, so \b fires AT the hyphen --
-    // which would falsely match `dotnet-1` inside `dotnet-10`. Our
+    // which would falsely match `svc-1` inside `svc-10`. Our
     // implementation uses explicit lookarounds with [\w-] to keep
     // hyphenated tokens whole.
-    const msg = `mention of dotnet-1-stuff`;
-    expect(findReferencedBacklogIds(msg, ["dotnet-1"])).toEqual([]);
+    const msg = `mention of svc-1-stuff`;
+    expect(findReferencedBacklogIds(msg, ["svc-1"])).toEqual([]);
   });
 
   it("matches at the start of the message (no left context)", () => {
-    const msg = `dotnet-2-add-dep is the focus here.`;
-    expect(findReferencedBacklogIds(msg, ["dotnet-2-add-dep"])).toEqual([
-      "dotnet-2-add-dep",
+    const msg = `svc-2-add-dep is the focus here.`;
+    expect(findReferencedBacklogIds(msg, ["svc-2-add-dep"])).toEqual([
+      "svc-2-add-dep",
     ]);
   });
 
   it("matches at the end of the message (no right context)", () => {
-    const msg = `Closes dotnet-2-add-dep`;
-    expect(findReferencedBacklogIds(msg, ["dotnet-2-add-dep"])).toEqual([
-      "dotnet-2-add-dep",
+    const msg = `Closes svc-2-add-dep`;
+    expect(findReferencedBacklogIds(msg, ["svc-2-add-dep"])).toEqual([
+      "svc-2-add-dep",
     ]);
   });
 
   it("deduplicates when the same id appears multiple times", () => {
-    const msg = `dotnet-2-add-dep on line one\ndotnet-2-add-dep on line two`;
-    expect(findReferencedBacklogIds(msg, ["dotnet-2-add-dep"])).toEqual([
-      "dotnet-2-add-dep",
+    const msg = `svc-2-add-dep on line one\nsvc-2-add-dep on line two`;
+    expect(findReferencedBacklogIds(msg, ["svc-2-add-dep"])).toEqual([
+      "svc-2-add-dep",
     ]);
   });
 
@@ -87,34 +87,34 @@ describe("findReferencedBacklogIds (kebab-case-id-safe match)", () => {
     expect(findReferencedBacklogIds(msg, ids).sort()).toEqual(ids.sort());
   });
 
-  it("REJECTS partial-prefix match (mentioning 'dotnet' alone)", () => {
-    // Operator might write `dotnet bug fix` in a commit body without
-    // intending to close `dotnet-2-add-dep`. The match must require
+  it("REJECTS partial-prefix match (mentioning the bare prefix alone)", () => {
+    // Operator might write `svc bug fix` in a commit body without
+    // intending to close `svc-2-add-dep`. The match must require
     // the FULL id, not a prefix.
     expect(
-      findReferencedBacklogIds("dotnet bug fix", ["dotnet-2-add-dep"]),
+      findReferencedBacklogIds("svc bug fix", ["svc-2-add-dep"]),
     ).toEqual([]);
   });
 
   it("REJECTS id wrapped in alphanumerics (no left/right boundary)", () => {
-    // `xdotnet-2-add-depy` should NOT match `dotnet-2-add-dep`.
+    // `xsvc-2-add-depy` should NOT match `svc-2-add-dep`.
     expect(
-      findReferencedBacklogIds("xdotnet-2-add-depy", ["dotnet-2-add-dep"]),
+      findReferencedBacklogIds("xsvc-2-add-depy", ["svc-2-add-dep"]),
     ).toEqual([]);
   });
 
   it("matches when id is surrounded by punctuation", () => {
     const cases = [
-      `(dotnet-2-add-dep)`,
-      `"dotnet-2-add-dep"`,
-      `[dotnet-2-add-dep]`,
-      `dotnet-2-add-dep.`,
-      `dotnet-2-add-dep,`,
-      `\`dotnet-2-add-dep\``,
+      `(svc-2-add-dep)`,
+      `"svc-2-add-dep"`,
+      `[svc-2-add-dep]`,
+      `svc-2-add-dep.`,
+      `svc-2-add-dep,`,
+      `\`svc-2-add-dep\``,
     ];
     for (const msg of cases) {
-      expect(findReferencedBacklogIds(msg, ["dotnet-2-add-dep"])).toEqual([
-        "dotnet-2-add-dep",
+      expect(findReferencedBacklogIds(msg, ["svc-2-add-dep"])).toEqual([
+        "svc-2-add-dep",
       ]);
     }
   });

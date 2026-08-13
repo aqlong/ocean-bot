@@ -65,6 +65,12 @@ describe("buildSafeChildEnv", () => {
     expect(out["ANTHROPIC_API_KEY"]).toBe("sk-ant-...");
   });
 
+  it("allowlists DEEPSEEK_API_KEY (c2w product needs it for DeepSeek backend)", () => {
+    const env = { DEEPSEEK_API_KEY: "sk-ds-..." };
+    const out = buildSafeChildEnv(env);
+    expect(out["DEEPSEEK_API_KEY"]).toBe("sk-ds-...");
+  });
+
   // GITHUB_TOKEN and GH_TOKEN are caught by the *_TOKEN pattern. They
   // are NOT on the explicit denylist but are structurally equivalent to
   // a repo-write credential; keeping them in the subprocess env would
@@ -73,17 +79,19 @@ describe("buildSafeChildEnv", () => {
   // keychain so the CLI works without these env vars. This test pins
   // the behavior so a future "allowlist GH_TOKEN for CI" change is
   // an explicit decision, not a silent drift.
-  it("GITHUB_TOKEN and GH_TOKEN are denied by *_TOKEN pattern; ANTHROPIC_API_KEY survives", () => {
+  it("GITHUB_TOKEN and GH_TOKEN are denied by *_TOKEN pattern; ANTHROPIC_API_KEY and DEEPSEEK_API_KEY survive", () => {
     const env = {
       GITHUB_TOKEN: "ghp_...",
       GH_TOKEN: "ghp_...",
       ANTHROPIC_API_KEY: "sk-ant-...",
+      DEEPSEEK_API_KEY: "sk-ds-...",
       PATH: "/usr/bin",
     };
     const out = buildSafeChildEnv(env);
     expect(out["GITHUB_TOKEN"]).toBeUndefined();
     expect(out["GH_TOKEN"]).toBeUndefined();
     expect(out["ANTHROPIC_API_KEY"]).toBe("sk-ant-...");
+    expect(out["DEEPSEEK_API_KEY"]).toBe("sk-ds-...");
     expect(out["PATH"]).toBe("/usr/bin");
   });
 

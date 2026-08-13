@@ -17,6 +17,7 @@ import {
   pickResumeSessionId,
   RESUME_TTL_MS,
   runTask,
+  ensureBacklogIdFooter,
 } from "./runner.js";
 import { git, isClean } from "./util/git.js";
 
@@ -787,4 +788,152 @@ describe("runTask, rate-limit detection via stderr patterns", () => {
     expect(result.rateLimitHit).toBe(true);
     expect(result.rateLimitReason).toBe("credits-exhausted");
   }, 15_000);
+});
+
+// ---------------------------------------------------------------------------
+// ensureBacklogIdFooter (ship-gate)
+// ---------------------------------------------------------------------------
+
+async function mkTmpGitRepo(): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "c2w-runner-gate-"));
+  const run = (args: string[]) =>
+    new Promise<void>((resolve, reject) => {
+      const { execFile } = require("node:child_process");
+      execFile("git", args, { cwd: dir }, (err: unknown) =>
+        err ? reject(err) : resolve(),
+      );
+    });
+  await run(["init", "-b", "main"]);
+  await run(["config", "user.email", "test@test"]);
+  await run(["config", "user.name", "test"]);
+  await fs.writeFile(path.join(dir, "file.ts"), "// stub");
+  await run(["add", "."]);
+  await run(["commit", "-m", "initial"]);
+  return dir;
+}
+
+async function commitInRepo(dir: string, msg: string): Promise<string> {
+  const { execFile } = require("node:child_process");
+  const run = (args: string[]) =>
+    new Promise<void>((resolve, reject) => {
+      execFile("git", args, { cwd: dir }, (err: unknown) =>
+        err ? reject(err) : resolve(),
+      );
+    });
+  const sha = () =>
+    new Promise<string>((resolve, reject) => {
+      execFile(
+        "git",
+        ["rev-parse", "HEAD"],
+        { cwd: dir },
+        (err: unknown, stdout: string) => (err ? reject(err) : resolve(stdout.trim())),
+      );
+    });
+  await fs.writeFile(path.join(dir, "change.ts"), `// ${Date.now()}`);
+  await run(["add", "."]);
+  await run(["commit", "-m", msg]);
+  return sha();
+}
+
+describe("ensureBacklogIdFooter (ship-gate)", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await mkTmpGitRepo();
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("amends commit when backlog id is absent from message", async () => {
+    const sha = await commitInRepo(tmpDir, "fix: do something useful");
+    const newSha = await ensureBacklogIdFooter(tmpDir, sha, "backlog:feature-abc-1");
+    expect(newSha).not.toBe(sha);
+    const { execFile } = require("node:child_process");
+    const body = await new Promise<string>((resolve, reject) => {
+      execFile(
+        "git",
+        ["log", "-1", "--format=%B"],
+        { cwd: tmpDir },
+        (err: unknown, stdout: string) => (err ? reject(err) : resolve(stdout)),
+      );
+    });
+    expect(body).toContain("Closes backlog item: feature-abc-1");
+    // whole-token: id appears as a standalone token
+    expect(body).toMatch(/(?<![\\w-])feature-abc-1(?![\\w-])/);
+  });
+
+  it("does not amend when backlog id is already present", async () => {
+    const sha = await commitInRepo(
+      tmpDir,
+      "fix: do something\n\nCloses backlog item: feature-abc-1",
+    );
+    const newSha = await ensureBacklogIdFooter(tmpDir, sha, "backlog:feature-abc-1");
+    expect(newSha).toBe(sha);
+  });
+
+  it("skips gate entirely for non-backlog taskIds", async () => {
+    const sha = await commitInRepo(tmpDir, "refactor: tighten things");
+    const newSha = await ensureBacklogIdFooter(tmpDir, sha, "creative:ocean-bot");
+    expect(newSha).toBe(sha);
+  });
+
+  it("skips gate when taskId is null", async () => {
+    const sha = await commitInRepo(tmpDir, "refactor: tighten things");
+    const newSha = await ensureBacklogIdFooter(tmpDir, sha, null);
+    expect(newSha).toBe(sha);
+  });
+
+  it("does not match a shorter id prefix inside a longer id", async () => {
+    // svc-1 should not be considered present when only svc-10 appears
+    const sha = await commitInRepo(
+      tmpDir,
+      "fix: ship svc-10 work",
+    );
+    const newSha = await ensureBacklogIdFooter(tmpDir, sha, "backlog:svc-1");
+    expect(newSha).not.toBe(sha);
+    const { execFile } = require("node:child_process");
+    const body = await new Promise<string>((resolve, reject) => {
+      execFile(
+        "git",
+        ["log", "-1", "--format=%B"],
+        { cwd: tmpDir },
+        (err: unknown, stdout: string) => (err ? reject(err) : resolve(stdout)),
+      );
+    });
+    expect(body).toContain("Closes backlog item: svc-1");
+  });
+
+  it("is idempotent: a second call on the amended sha does not re-amend", async () => {
+    // After pass 1 appends "Closes backlog item: <id>", pass 2 must see
+    // the id as already-referenced and return the amended sha unchanged.
+    // Failure mode this guards: duplicate footers stacking on retried ticks.
+    const sha = await commitInRepo(tmpDir, "fix: do something useful");
+    const sha2 = await ensureBacklogIdFooter(tmpDir, sha, "backlog:feature-abc-1");
+    expect(sha2).not.toBe(sha);
+    const sha3 = await ensureBacklogIdFooter(tmpDir, sha2, "backlog:feature-abc-1");
+    expect(sha3).toBe(sha2);
+    const { execFile } = require("node:child_process");
+    const body = await new Promise<string>((resolve, reject) => {
+      execFile(
+        "git",
+        ["log", "-1", "--format=%B"],
+        { cwd: tmpDir },
+        (err: unknown, stdout: string) => (err ? reject(err) : resolve(stdout)),
+      );
+    });
+    const occurrences = body.match(/Closes backlog item: feature-abc-1/g) ?? [];
+    expect(occurrences.length).toBe(1);
+  });
+
+  it("treats backlog id in commit subject as already-referenced", async () => {
+    // A subject like "fix(feature-abc-1): ..." references the id as a whole
+    // token (the surrounding parens are not \w or '-' per the matcher's
+    // lookarounds). Gate must skip so prompts that name the backlog id in
+    // their subject don't get a redundant footer appended.
+    const sha = await commitInRepo(tmpDir, "fix(feature-abc-1): ship the thing");
+    const newSha = await ensureBacklogIdFooter(tmpDir, sha, "backlog:feature-abc-1");
+    expect(newSha).toBe(sha);
+  });
 });

@@ -12,6 +12,7 @@
 import { getDb, schema } from "./db/index.js";
 import { eq, desc, and, gte, ilike, sql } from "drizzle-orm";
 import { log } from "./util/log.js";
+import { isBacklogIdReferenced } from "./util/backlog-id-match.js";
 import type {
   NewOceanBotRun,
   NewOceanBotEvent,
@@ -579,14 +580,11 @@ export async function listOpenBacklogIds(project: string): Promise<string[]> {
  * Pure helper. Find backlog ids whose full string appears in the commit
  * message as a whole token (not a substring of another id).
  *
- * Kebab-case-id-safe: rejects substring matches like `dotnet-1` inside
- * `dotnet-10`. JS \b doesn't treat `-` as a word-boundary character
- * (hyphen is non-word, so \b fires AT the hyphen), so this uses explicit
- * lookarounds that include `-` in the "still inside an id" predicate.
- *
- * Exported (and unit-tested) because false-positive auto-closes are
- * expensive (an item is silently removed from the queue), and the only
- * way to keep them away is to be conservative + reviewable.
+ * Matching rule lives in util/backlog-id-match.ts so the receive-side
+ * (this function) and the send-side ship-gate (runner.ensureBacklogIdFooter)
+ * cannot drift. False-positive auto-closes are expensive (an item is
+ * silently removed from the queue), and false-negative ship-gates churn
+ * commits, so both must agree byte-for-byte on what counts as a match.
  */
 export function findReferencedBacklogIds(
   message: string,
@@ -595,9 +593,7 @@ export function findReferencedBacklogIds(
   if (!message || openIds.length === 0) return [];
   const found = new Set<string>();
   for (const id of openIds) {
-    const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`);
-    if (re.test(message)) found.add(id);
+    if (isBacklogIdReferenced(message, id)) found.add(id);
   }
   return [...found];
 }
@@ -613,10 +609,10 @@ export function findReferencedBacklogIds(
  * no-op without overwriting their existing closed metadata. Per-item
  * try-catch so a single failure doesn't lose the rest.
  *
- * Fixes the stale-open class that bit dotnet-* 2026-05-22 -> 2026-05-26:
- * the C# parser shipped via creative queue (06e276f) and none of the
- * dotnet-2..10 backlog items got closed because markBacklogItemDone
- * only fires for taskIds with the `backlog:` prefix. Now any commit
+ * Fixes the stale-open class that bit us for 4 days in May 2026: a large
+ * parser feature shipped through the creative queue, and none of the
+ * backlog items it satisfied got closed, because markBacklogItemDone
+ * only fires for taskIds carrying the `backlog:` prefix. Now any commit
  * message that names an open id closes that id.
  */
 export async function closeBacklogItemsByIds(
