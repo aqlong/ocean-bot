@@ -73,13 +73,83 @@ const DESTRUCTIVE_SQL =
 const FETCH_HOST_RE =
   /(?:fetch|new\s+URL)\s*\(\s*["'`]https?:\/\/([a-z0-9.-]+)/gi;
 
-const SECRET_PATH_RE =
-  /(^|\/)(\.env(\..+)?|secrets?[^/]*|[^/]*key[^/]*\.pem|[^/]*\.pem)$/i;
+/**
+ * Credential-like paths (rule 8).
+ *
+ * The previous single regex anchored `.env` and `secret` to the START of a
+ * filename, so an entire class of real credential files walked straight
+ * past a rule that is supposed to be unbypassable. Verified evasions:
+ * staging.env, production.env, my-secrets.json, aws-credentials.json,
+ * credentials.json, service-account-key.json, .ssh/id_rsa, id_ed25519,
+ * .npmrc, .netrc. Only `.env`-prefixed names and `*.pem` were caught.
+ *
+ * Split into two tiers because the obvious widening (match any filename
+ * containing "key" or "token") floods on ordinary source: keyboard.ts,
+ * keys.ts, tokenizer.ts, keymap.tsx. Source files therefore match only
+ * the unambiguous patterns; everything else also matches a delimited
+ * key/token filename token.
+ *
+ * Measured over the 637 tracked files in the origin monorepo: 8 flags,
+ * all genuinely credential-adjacent (.env.example templates, the
+ * secret-comparison helper, the credential store, the secret-migration
+ * script). No spurious hits.
+ */
+const SECRET_PATH_UNAMBIGUOUS_RE = new RegExp(
+  [
+    // .env, .env.local, config/.env.test
+    String.raw`(^|/)\.env(\.[^/]*)?$`,
+    // staging.env, production.env
+    String.raw`(^|/)[^/]*\.env$`,
+    // my-secrets.json, aws-credentials.json, secret.yaml
+    String.raw`(^|/)[^/]*(secret|credential)s?[^/]*$`,
+    // private key material by extension
+    String.raw`\.(pem|p12|pfx|jks|keystore|asc|ppk)$`,
+  ].join("|"),
+  "i",
+);
+
+const SECRET_PATH_LOOSE_RE = new RegExp(
+  [
+    SECRET_PATH_UNAMBIGUOUS_RE.source,
+    // app.key, deploy/api-token.txt, service-account-key.json
+    String.raw`\.key$`,
+    String.raw`(^|/|[-_.])(keys?|tokens?)([-_.][^/]*)?$`,
+    // ssh private keys
+    String.raw`(^|/)id_(rsa|dsa|ecdsa|ed25519)$`,
+    // auth config dotfiles
+    String.raw`(^|/)\.(npmrc|netrc|pgpass|htpasswd|pypirc|dockercfg)$`,
+  ].join("|"),
+  "i",
+);
+
+/** Extensions where a "key"/"token" filename token is a code identifier. */
+const SOURCE_EXT_RE =
+  /\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|php|c|h|cpp|cs|swift|kt|scala|sh|sql|md|css|scss|html)$/i;
+
+export function isSecretLikePath(file: string): boolean {
+  return SOURCE_EXT_RE.test(file)
+    ? SECRET_PATH_UNAMBIGUOUS_RE.test(file)
+    : SECRET_PATH_LOOSE_RE.test(file);
+}
 
 const CI_WORKFLOW_RE = /^\.github\/workflows\/.+\.ya?ml$/;
 
+/**
+ * Destructive git commands appearing in a patch (rule 10).
+ *
+ * The rebase clause exempts `git rebase --abort` so the bot does not flag
+ * its own recovery code (push.ts aborts a failed rebase to leave a clean
+ * tree). That exemption used to be written as `git\s+rebase\s+\b(?!.*--abort)`,
+ * whose lookahead scanned the whole REST OF THE LINE, so any line that
+ * mentioned --abort anywhere suppressed the match entirely. Verified
+ * evasions: `git rebase origin/main && git rebase --abort` and
+ * `git rebase origin/main # see git rebase --abort docs`.
+ *
+ * Scoping the lookahead to the rebase invocation itself keeps the
+ * exemption and closes the bypass.
+ */
 const FORCE_PUSH_RE =
-  /git\s+push\s+(?:[^&;|]*\s)?-(?:f|-force(?:-with-lease)?)|git\s+reset\s+--hard|git\s+branch\s+-D|git\s+rebase\s+\b(?!.*--abort)/i;
+  /git\s+push\s+(?:[^&;|]*\s)?-(?:f|-force(?:-with-lease)?)|git\s+reset\s+--hard|git\s+branch\s+-D|git\s+rebase(?!\s+--abort\b)\b/i;
 
 export function applyRules(
   diff: DiffSummary,
@@ -153,7 +223,7 @@ export function applyRules(
   }
 
   // Rule 8, secret-like paths
-  const secretHits = diff.files.filter((f) => SECRET_PATH_RE.test(f));
+  const secretHits = diff.files.filter((f) => isSecretLikePath(f));
   if (secretHits.length > 0) {
     reasons.push({
       ruleId: 8,

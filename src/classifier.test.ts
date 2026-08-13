@@ -196,6 +196,79 @@ describe("classifier, rule 8 (secrets / keys)", () => {
       applyRules(diff(["secrets-store.json"]), code2wikiCfg).map((x) => x.ruleId),
     ).toContain(8);
   });
+
+  // The four cases above are the ones the original regex handled. It
+  // anchored `.env` and `secret` to the START of the filename, so the
+  // realistic names below all walked past a CRITICAL rule. Each of these
+  // was verified to evade before the fix; they are the regression set.
+  describe("credential paths that used to evade the start-anchored regex", () => {
+    const mustFlag = [
+      // dotenv with a prefix rather than a prefix-less name
+      "staging.env",
+      "production.env",
+      "config/.env.test",
+      // "secret"/"credential" not at position zero
+      "my-secrets.json",
+      "aws-credentials.json",
+      "credentials.json",
+      "app/secret.yaml",
+      // key material that is not a .pem
+      "keys/app.key",
+      "cert.p12",
+      "cert.pfx",
+      "service-account-key.json",
+      "deploy/api-token.txt",
+      // ssh private keys
+      ".ssh/id_rsa",
+      "id_ed25519",
+      // auth config dotfiles
+      ".npmrc",
+      ".netrc",
+      ".pgpass",
+    ];
+
+    for (const file of mustFlag) {
+      it(`flags ${file}`, () => {
+        expect(
+          applyRules(diff([file]), code2wikiCfg).map((x) => x.ruleId),
+        ).toContain(8);
+      });
+    }
+  });
+
+  // The widening has to stop short of ordinary source. A rule 8 hit is
+  // CRITICAL: it blocks the push and demands operator approval. Flooding
+  // on keyboard.ts would train the operator to wave rule 8 through, which
+  // is a worse outcome than the gap this fix closes.
+  describe("does not flag source files whose names merely contain key/token", () => {
+    const mustNotFlag = [
+      "src/keyboard.ts",
+      "src/monkey.ts",
+      "src/lib/keys.ts",
+      "src/tokenizer.ts",
+      "src/util/token.ts",
+      "src/keymap.tsx",
+      "src/core/tokens.ts",
+      "docs/api-keys.md",
+      "package.json",
+      "README.md",
+    ];
+
+    for (const file of mustNotFlag) {
+      it(`does NOT flag ${file}`, () => {
+        expect(
+          applyRules(diff([file]), code2wikiCfg).map((x) => x.ruleId),
+        ).not.toContain(8);
+      });
+    }
+  });
+
+  it("names the offending file in the explanation", () => {
+    // The operator sees only this string when deciding whether to approve.
+    const reasons = applyRules(diff(["aws-credentials.json"]), code2wikiCfg);
+    const rule8 = reasons.find((r) => r.ruleId === 8);
+    expect(rule8?.explanation).toContain("aws-credentials.json");
+  });
 });
 
 describe("classifier, rule 9 (CI workflows)", () => {
@@ -255,6 +328,58 @@ describe("classifier, rule 10 (destructive git in patch)", () => {
       code2wikiCfg,
     );
     expect(r.map((x) => x.ruleId)).toContain(10);
+  });
+
+  // The rebase branch carries the only exemption in this rule, and it was
+  // the only branch with no test. The exemption exists so the bot does not
+  // flag its own recovery code: push.ts aborts a failed rebase to leave a
+  // clean tree.
+  describe("rebase, and the --abort exemption", () => {
+    it("flags a plain rebase", () => {
+      const r = applyRules(
+        diff(["scripts/sync.sh"], "+git rebase origin/main"),
+        code2wikiCfg,
+      );
+      expect(r.map((x) => x.ruleId)).toContain(10);
+    });
+
+    it("does NOT flag a bare rebase --abort", () => {
+      const r = applyRules(
+        diff(["src/push.ts"], "+  await git(dir, 'git rebase --abort');"),
+        code2wikiCfg,
+      );
+      expect(r.map((x) => x.ruleId)).not.toContain(10);
+    });
+
+    // The exemption used to be written with a lookahead that scanned the
+    // whole rest of the line, so mentioning --abort ANYWHERE downstream
+    // suppressed the match. Both of these were verified to evade a rule
+    // that is supposed to be unbypassable.
+    it("flags a rebase chained before an abort on the same line", () => {
+      const r = applyRules(
+        diff(["scripts/sync.sh"], "+git rebase origin/main && git rebase --abort"),
+        code2wikiCfg,
+      );
+      expect(r.map((x) => x.ruleId)).toContain(10);
+    });
+
+    it("flags a rebase whose trailing comment mentions --abort", () => {
+      const r = applyRules(
+        diff(["scripts/sync.sh"], "+git rebase origin/main # see git rebase --abort"),
+        code2wikiCfg,
+      );
+      expect(r.map((x) => x.ruleId)).toContain(10);
+    });
+
+    it("flags a force-push even when the line also mentions --abort", () => {
+      // Same class of bypass against a different clause: proves the fix is
+      // scoped to the rebase lookahead and did not weaken the others.
+      const r = applyRules(
+        diff(["scripts/deploy.sh"], "+git push -f origin main # not git rebase --abort"),
+        code2wikiCfg,
+      );
+      expect(r.map((x) => x.ruleId)).toContain(10);
+    });
   });
 });
 
