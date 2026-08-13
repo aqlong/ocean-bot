@@ -275,7 +275,12 @@ function buildAdapters(cfg: BotConfig): ProjectAdapter[] {
   return out;
 }
 
-async function tick(
+/**
+ * One pass of the loop. Exported for tests: the ORDER of the gates below
+ * is the contract, and it is not observable from any single unit test of
+ * the pieces it wires. See index.orchestration.test.ts.
+ */
+export async function tick(
   cfg: BotConfig,
   adapters: ProjectAdapter[],
   opts: TickOpts,
@@ -624,7 +629,14 @@ async function autoCloseReferencedBacklogItems(
   }
 }
 
-async function executeRun(
+/**
+ * Run one task end to end: spawn, diff, preflight, classify, then push or
+ * hold. Exported for tests. This is the function that turns decidePush's
+ * verdict into an action, so a wiring bug here (an inverted condition, a
+ * missing return) would auto-push work that should have required approval,
+ * while every unit test of decidePush itself still passed.
+ */
+export async function executeRun(
   cfg: BotConfig,
   adapter: ProjectAdapter,
   pick: ScoredCandidate,
@@ -1141,7 +1153,13 @@ async function executeRun(
   }
 }
 
-async function pushApprovedRuns(adapter: ProjectAdapter): Promise<void> {
+/**
+ * Ship runs the operator approved on the dashboard. Exported for tests.
+ * Called before the budget gate on purpose: a push spends no tokens, so an
+ * explicit human approval should not sit unexecuted because the bot is
+ * near a cap it is not about to touch.
+ */
+export async function pushApprovedRuns(adapter: ProjectAdapter): Promise<void> {
   const approved = await findApprovedRuns(adapter.name);
   for (const run of approved) {
     if (run.project !== adapter.name) continue;
@@ -1302,7 +1320,29 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-main().catch((e) => {
-  log.error("ocean-bot.fatal", { err: errMsg(e) });
-  process.exit(1);
-});
+/**
+ * True only when this module is the process entry point.
+ *
+ * Without this guard, `main()` ran on IMPORT, which meant importing this
+ * module for any reason started the bot: connected to Postgres, took the
+ * tick lock, and began spawning Claude sessions. That made the tick
+ * orchestrator, the single highest-blast-radius file here, impossible to
+ * unit test, so the ordering of the gates it wires was verified only by
+ * reading it.
+ *
+ * Compared against a resolved path rather than by string-comparing
+ * `import.meta.url` to `file://${process.argv[1]}`. The naive form breaks
+ * whenever the path needs URL encoding (a space anywhere in the install
+ * directory is enough) and would silently stop launching the bot. Same
+ * check, done in a way that cannot misfire on a path we do not control.
+ */
+const isCliRun =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isCliRun) {
+  main().catch((e) => {
+    log.error("ocean-bot.fatal", { err: errMsg(e) });
+    process.exit(1);
+  });
+}

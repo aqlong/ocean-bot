@@ -154,7 +154,7 @@ npm test          # vitest
 npm run typecheck # tsc --noEmit
 ```
 
-78 of the 625 tests here are integration tests against a real Postgres, so they are gated on an env var and skip cleanly when it is absent. To run everything:
+78 of the 644 tests here are integration tests against a real Postgres, so they are gated on an env var and skip cleanly when it is absent. To run everything:
 
 ```bash
 createdb ocean_bot_test
@@ -176,7 +176,7 @@ bash scripts/install-logrotate.test.sh
 It works, it runs unattended, and it ships real commits. It is also single-operator software with sharp edges worth naming:
 
 - **macOS and launchd only.** Nothing is portable to systemd or a container without work; the boot wrapper and both installers assume launchctl.
-- **The tick orchestrator has no direct tests.** The individual pieces are well covered, but `src/index.ts`, which wires them in order, is verified only through its parts.
+- **The tick orchestrator's coverage is thin, though no longer absent.** `src/index.orchestration.test.ts` pins the push gate and the gate ordering that matter most, verified by mutation rather than by passing. The rest of `src/index.ts`, the rate-limit backoff and the scout handoff in particular, is still covered only through its parts.
 - **`claude -p` is the execution model.** The bot shells out to the CLI and parses its event stream, so it inherits that interface's stability.
 - **Adapters are compiled in.** Adding a project means writing a file and rebuilding, not dropping in a plugin.
 - **The dashboard assumes one user.** Auth is a single GitHub id compared against an env var. It is a control panel, not a multi-tenant product.
