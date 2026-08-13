@@ -53,15 +53,32 @@ function mkAdapter(commands: string[]): ProjectAdapter {
 }
 
 /**
- * Run a preflight command that dumps its environment and fails, then return
- * what the subprocess saw. Preflight only retains output for FAILING
- * commands (tailLog on the failure record), hence the explicit `exit 1`.
+ * Ask the subprocess to report only the canary variables, then return what
+ * it printed. Preflight retains output only for FAILING commands (tailLog
+ * on the failure record), hence the explicit `exit 1`.
+ *
+ * This echoes six named keys rather than dumping `env`, because tailLog is
+ * `combined.slice(-2000)`. A full env dump fits in 2000 characters on a
+ * developer laptop and does not on a CI runner, which injects roughly sixty
+ * additional variables: the alphabetically early keys scroll out of the
+ * tail and the test fails for a reason unrelated to scrubbing. Found by CI
+ * on the first run of this file. Echoing named keys is also a stronger
+ * assertion, since `<unset>` positively distinguishes "dropped" from
+ * "present but truncated away".
  */
 async function envSeenByPreflight(): Promise<string> {
-  const result = await runPreflight(mkAdapter(["env; exit 1"]));
+  const probe =
+    Object.keys(CANARY)
+      .map((k) => `echo "${k}=\${${k}:-<unset>}"`)
+      .join("; ") + "; exit 1";
+  const result = await runPreflight(mkAdapter([probe]));
   expect(result.ok).toBe(false);
   expect(result.failures).toHaveLength(1);
-  return result.failures[0]?.tailLog ?? "";
+  const log = result.failures[0]?.tailLog ?? "";
+  // Guards the probe: if the command itself failed to run, every
+  // "not.toContain" assertion below would pass vacuously.
+  expect(log).toMatch(/ANTHROPIC_API_KEY=/);
+  return log;
 }
 
 describe("preflight subprocess env scrubbing", () => {
@@ -83,8 +100,8 @@ describe("preflight subprocess env scrubbing", () => {
 
   it("does not leak explicitly denylisted secrets into the subprocess", async () => {
     const env = await envSeenByPreflight();
-    expect(env).not.toContain(CANARY.OCEAN_BOT_DATABASE_URL);
-    expect(env).not.toContain(CANARY.STRIPE_SECRET_KEY);
+    expect(env).toContain("OCEAN_BOT_DATABASE_URL=<unset>");
+    expect(env).toContain("STRIPE_SECRET_KEY=<unset>");
     // The value, not just the key: a partial scrub that kept the value
     // under a different name would still be a leak.
     expect(env).not.toContain("dbsecret111");
@@ -93,9 +110,12 @@ describe("preflight subprocess env scrubbing", () => {
 
   it("does not leak pattern-matched secrets (_TOKEN / _PASSWORD / _PRIVATE_KEY)", async () => {
     const env = await envSeenByPreflight();
-    expect(env).not.toContain(CANARY.GITHUB_APP_PRIVATE_KEY);
-    expect(env).not.toContain(CANARY.SOME_SERVICE_TOKEN);
-    expect(env).not.toContain(CANARY.ADMIN_PASSWORD);
+    expect(env).toContain("GITHUB_APP_PRIVATE_KEY=<unset>");
+    expect(env).toContain("SOME_SERVICE_TOKEN=<unset>");
+    expect(env).toContain("ADMIN_PASSWORD=<unset>");
+    expect(env).not.toContain("canary-private-key-333");
+    expect(env).not.toContain("canary-token-444");
+    expect(env).not.toContain("canary-password-555");
   });
 
   it("still passes through the allowlisted Anthropic key", async () => {
@@ -103,7 +123,7 @@ describe("preflight subprocess env scrubbing", () => {
     // this. If the scrub over-reached, preflight would fail for reasons
     // that look like flaky tests rather than a config change.
     const env = await envSeenByPreflight();
-    expect(env).toContain(CANARY.ANTHROPIC_API_KEY);
+    expect(env).toContain(`ANTHROPIC_API_KEY=${CANARY.ANTHROPIC_API_KEY}`);
   });
 
   it("keeps enough of the environment for commands to actually run", async () => {
