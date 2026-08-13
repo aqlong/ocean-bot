@@ -1,5 +1,13 @@
 import { signIn } from "@/lib/auth";
 
+// Load-bearing: the root layout renders <BotStatusBadge />, which queries
+// ocean_bot_state. Without force-dynamic this page is the one route Next
+// prerenders at build time, so `next build` opens a Postgres connection and
+// fails on any machine without a reachable DB (fresh clone, CI, Docker
+// build stage). Every sibling page already declares it; sign-in was missed
+// because it has no data of its own. See dashboard/app/no-static.test.ts.
+export const dynamic = "force-dynamic";
+
 export default function SignIn() {
   return (
     <div className="mx-auto flex min-h-[60vh] max-w-md flex-col items-center justify-center gap-4">
