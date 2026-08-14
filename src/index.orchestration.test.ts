@@ -6,6 +6,10 @@ import type {
 } from "./adapters/types.js";
 import type { BotConfig, ApprovalMode } from "./config.js";
 import type { PreflightResult, PushResult } from "./push.js";
+import { SCOUT_DESCRIPTION_THRESHOLD } from "./scout.js";
+import type { ScoutOutcome } from "./scout.js";
+import type { ResolverOutcome } from "./scout-resolver.js";
+import type { RateLimitPause } from "./journal.js";
 import type { ScoredCandidate } from "./queue.js";
 import type { BudgetDecision } from "./budget.js";
 
@@ -57,7 +61,10 @@ const journal = vi.hoisted(() => ({
   listOpenBacklogIds: vi.fn(async () => [] as string[]),
   findReferencedBacklogIds: vi.fn(() => [] as string[]),
   closeBacklogItemsByIds: vi.fn(async () => {}),
-  blockBacklogItemForOperatorAction: vi.fn(async () => {}),
+  blockBacklogItemForOperatorAction:
+    vi.fn<(backlogId: string, meta: { runId: string; reason: string }) => Promise<void>>(
+      async () => {},
+    ),
   countOrphanFailuresForTaskId: vi.fn(async () => 0),
   blockBacklogItemForOrphanRetries: vi.fn(async () => {}),
   lastFailedModelForTaskId: vi.fn(async () => null),
@@ -66,10 +73,13 @@ const journal = vi.hoisted(() => ({
   clearFiveHrWindowStart: vi.fn(async () => {}),
   getLastSessionForProject: vi.fn(async () => null),
   setLastSessionForProject: vi.fn(async () => {}),
-  getRateLimitPause: vi.fn(async () => null),
+  getRateLimitPause: vi.fn<() => Promise<RateLimitPause | null>>(async () => null),
   clearRateLimitPause: vi.fn(async () => {}),
-  setRateLimitPause: vi.fn(async () => {}),
-  appendRateLimitHistory: vi.fn(async () => {}),
+  setRateLimitPause: vi.fn<(pause: RateLimitPause) => Promise<void>>(async () => {}),
+  appendRateLimitHistory:
+    vi.fn<(entry: { ts: number; reason: string; runId: string }) => Promise<void>>(
+      async () => {},
+    ),
 }));
 vi.mock("./journal.js", () => journal);
 
@@ -185,6 +195,28 @@ vi.mock("./queue.js", async (importOriginal) => {
   return { ...actual, ...queueMod };
 });
 
+// Scout and resolver both spawn `claude -p`, so the spawning entry points
+// are faked. Everything else in these modules stays REAL: SCOUT_DESCRIPTION_
+// THRESHOLD decides whether the scout runs at all, and fallbackOnFailure /
+// applyGoalWrapper are pure functions that encode behavior under test (the
+// fail-safe verdict and the goal envelope). Faking those would test the
+// stubs instead of the handoff.
+const scoutMod = vi.hoisted(() => ({
+  scoutTask: vi.fn<() => Promise<ScoutOutcome>>(),
+}));
+vi.mock("./scout.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./scout.js")>();
+  return { ...actual, ...scoutMod };
+});
+
+const resolverMod = vi.hoisted(() => ({
+  resolveScoutScope: vi.fn<() => Promise<ResolverOutcome>>(),
+}));
+vi.mock("./scout-resolver.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./scout-resolver.js")>();
+  return { ...actual, ...resolverMod };
+});
+
 vi.mock("./db/index.js", () => ({ closeDb: vi.fn(async () => {}) }));
 
 const { executeRun, tick, pushApprovedRuns } = await import("./index.js");
@@ -250,10 +282,47 @@ function mkPick(over: Partial<ScoredCandidate> = {}): ScoredCandidate {
     estTokens: 1000,
     score: 50,
     complex: false,
+    ...over,
   } as ScoredCandidate;
 }
 
 const OK_BUDGET: BudgetDecision = { gate: "ok", worstRatio: 0.1 } as BudgetDecision;
+
+/**
+ * A pick that trips the scout gate, which fires only on tasks flagged
+ * complex whose description exceeds SCOUT_DESCRIPTION_THRESHOLD (1500).
+ * The threshold is imported real rather than hardcoded here, so raising it
+ * in scout.ts cannot leave these tests silently exercising the wrong path.
+ */
+function mkComplexPick(over: Partial<ScoredCandidate> = {}): ScoredCandidate {
+  return mkPick({
+    complex: true,
+    summary: `migrate the publisher layer. ${"detail ".repeat(
+      Math.ceil((SCOUT_DESCRIPTION_THRESHOLD + 100) / 7),
+    )}`,
+    ...over,
+  });
+}
+
+/** The two backoff windows, as asserted deltas rather than wall-clock. */
+const ONE_HOUR_MS = 60 * 60 * 1000;
+const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+/** A runner result that hit a rate limit and exited non-zero. */
+function rateLimited(reason: string | undefined) {
+  return {
+    exitCode: 1,
+    durationMs: 500,
+    toolUses: 0,
+    bytesIn: 0,
+    bytesOut: 0,
+    outputTokens: 0,
+    toolUseCapHit: false,
+    tokenCapHit: false,
+    rateLimitHit: true,
+    ...(reason === undefined ? {} : { rateLimitReason: reason }),
+  };
+}
 
 /** A run that produced a commit: HEAD moves off the base sha. */
 function runProducedACommit(): void {
@@ -320,6 +389,21 @@ function setDefaults(): void {
 
   runner.acquireLock.mockResolvedValue(true);
   runner.isInteractiveClaudeRunning.mockResolvedValue(false);
+  // A clean session that produced no commit: HEAD stays at the default
+  // base sha. Neutral, and it means a test that forgets to configure the
+  // runner fails on its own assertion rather than on a confusing
+  // "cannot read exitCode of undefined" from inside executeRun.
+  runner.runTask.mockResolvedValue({
+    exitCode: 0,
+    durationMs: 10,
+    sessionId: "session-default",
+    toolUses: 0,
+    bytesIn: 0,
+    bytesOut: 0,
+    outputTokens: 0,
+    toolUseCapHit: false,
+    tokenCapHit: false,
+  });
   runner.classifyNoopRun.mockResolvedValue({ kind: "clean" });
   runner.pickResumeSessionId.mockReturnValue(undefined);
   runner.ensureBacklogIdFooter.mockImplementation(
@@ -361,6 +445,20 @@ function setDefaults(): void {
   budgetMod.loadUsageRows.mockResolvedValue([]);
 
   queueMod.pickNext.mockResolvedValue(null);
+
+  // Scout finds nothing by default, so the ordinary path never reaches the
+  // resolver. Tests that exercise the handoff opt in explicitly.
+  scoutMod.scoutTask.mockResolvedValue({
+    result: null,
+    hasScopeWarnings: false,
+    failure: null,
+    cached: false,
+  });
+  resolverMod.resolveScoutScope.mockResolvedValue({
+    result: { verdict: "proceed", explanation: "technical scope, resolved" },
+    failure: null,
+    cached: false,
+  });
 }
 
 beforeEach(() => {
@@ -665,6 +763,371 @@ describe("tick gate ordering", () => {
     expect(runner.runTask).not.toHaveBeenCalled();
     expect(pushMod.pushToTarget).not.toHaveBeenCalled();
     expect(runner.releaseLock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ------------------------------------------------- rate-limit backoff
+
+describe("rate-limit backoff", () => {
+  describe("the tick gate that honors an active pause", () => {
+    it("skips the whole tick while the backoff window is open", async () => {
+      journal.getRateLimitPause.mockResolvedValue({
+        pausedAt: Date.now() - 60_000,
+        reason: "429",
+        resumeAfter: Date.now() + 30 * 60_000,
+      });
+
+      await tick(mkCfg(), [mkAdapter()], { dryRun: false });
+
+      expect(queueMod.pickNext).not.toHaveBeenCalled();
+      expect(runner.runTask).not.toHaveBeenCalled();
+      // Still released: the gate sits inside the try/finally.
+      expect(runner.releaseLock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not clear a pause that is still in force", async () => {
+      // Clearing early would resume straight into the same 429 and burn
+      // another request against a limit that has not reset.
+      journal.getRateLimitPause.mockResolvedValue({
+        pausedAt: Date.now(),
+        reason: "429",
+        resumeAfter: Date.now() + 30 * 60_000,
+      });
+
+      await tick(mkCfg(), [mkAdapter()], { dryRun: false });
+
+      expect(journal.clearRateLimitPause).not.toHaveBeenCalled();
+    });
+
+    it("auto-resumes once the window has elapsed", async () => {
+      // The bot has to recover without the operator. An expired key that
+      // never gets cleared is an indefinite outage that looks like a
+      // healthy idle loop.
+      journal.getRateLimitPause.mockResolvedValue({
+        pausedAt: Date.now() - 2 * 60 * 60_000,
+        reason: "429",
+        resumeAfter: Date.now() - 1000,
+      });
+
+      await tick(mkCfg(), [mkAdapter()], { dryRun: false });
+
+      expect(journal.clearRateLimitPause).toHaveBeenCalledTimes(1);
+      // And the tick carried on rather than returning after the cleanup.
+      expect(queueMod.pickNext).toHaveBeenCalled();
+    });
+
+    it("touches nothing when no pause is recorded", async () => {
+      journal.getRateLimitPause.mockResolvedValue(null);
+
+      await tick(mkCfg(), [mkAdapter()], { dryRun: false });
+
+      expect(journal.clearRateLimitPause).not.toHaveBeenCalled();
+      expect(queueMod.pickNext).toHaveBeenCalled();
+    });
+  });
+
+  describe("the run path that sets a pause", () => {
+    it("backs off one hour on a generic 429", async () => {
+      runner.runTask.mockResolvedValue(rateLimited(undefined));
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkPick(), OK_BUDGET);
+
+      expect(journal.setRateLimitPause).toHaveBeenCalledTimes(1);
+      const pause = journal.setRateLimitPause.mock.calls[0]?.[0] as {
+        pausedAt: number;
+        resumeAfter: number;
+        reason: string;
+      };
+      // Asserted as a delta so the test does not depend on the clock.
+      expect(pause.resumeAfter - pause.pausedAt).toBe(ONE_HOUR_MS);
+      expect(pause.reason).toBe("429");
+    });
+
+    it("backs off six hours when credits are exhausted", async () => {
+      // The distinction is the point. A 429 sheds load and clears in
+      // minutes; an exhausted credit pool does not refill on its own, and
+      // retrying hourly just burns whatever balance is left before the
+      // operator can top it up.
+      runner.runTask.mockResolvedValue(rateLimited("credits-exhausted"));
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkPick(), OK_BUDGET);
+
+      const pause = journal.setRateLimitPause.mock.calls[0]?.[0] as {
+        pausedAt: number;
+        resumeAfter: number;
+        reason: string;
+      };
+      expect(pause.resumeAfter - pause.pausedAt).toBe(SIX_HOURS_MS);
+      expect(pause.reason).toBe("credits-exhausted");
+      expect(pause.resumeAfter - pause.pausedAt).not.toBe(ONE_HOUR_MS);
+    });
+
+    it("records the rate limit in history with its run id", async () => {
+      // /budget renders this to show how often the bot is hitting limits.
+      runner.runTask.mockResolvedValue(rateLimited("credits-exhausted"));
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkPick(), OK_BUDGET);
+
+      expect(journal.appendRateLimitHistory).toHaveBeenCalledTimes(1);
+      const entry = journal.appendRateLimitHistory.mock.calls[0]?.[0] as {
+        reason: string;
+        runId: string;
+      };
+      expect(entry.reason).toBe("credits-exhausted");
+      expect(entry.runId).toBeTruthy();
+    });
+
+    it("marks the run failed and never reaches the push gate", async () => {
+      runner.runTask.mockResolvedValue(rateLimited("429"));
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkPick(), OK_BUDGET);
+
+      expect(terminalStatus()).toBe("failed");
+      expect(pushMod.runPreflight).not.toHaveBeenCalled();
+      expect(pushMod.pushToTarget).not.toHaveBeenCalled();
+    });
+
+    it("does NOT pause the bot for an ordinary failure", async () => {
+      // The negative case matters more than the positives here. Pausing on
+      // every non-zero exit would idle the bot for an hour over one failing
+      // test run.
+      runner.runTask.mockResolvedValue({
+        exitCode: 1,
+        durationMs: 500,
+        toolUses: 2,
+        bytesIn: 0,
+        bytesOut: 0,
+        outputTokens: 0,
+        toolUseCapHit: false,
+        tokenCapHit: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkPick(), OK_BUDGET);
+
+      expect(terminalStatus()).toBe("failed");
+      expect(journal.setRateLimitPause).not.toHaveBeenCalled();
+      expect(journal.appendRateLimitHistory).not.toHaveBeenCalled();
+    });
+  });
+});
+
+// ---------------------------------------------------- scout handoff
+
+describe("scout and resolver handoff", () => {
+  it("does not scout a short, simple task", async () => {
+    // The scout costs a Haiku call per run. Spending it on "fix a typo"
+    // is pure overhead.
+    runProducedACommit();
+
+    await executeRun(mkCfg("auto"), mkAdapter(), mkPick(), OK_BUDGET);
+
+    expect(scoutMod.scoutTask).not.toHaveBeenCalled();
+    expect(runner.runTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("scouts a complex task with a long description", async () => {
+    runProducedACommit();
+
+    await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+    expect(scoutMod.scoutTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips the resolver when the scout raises no warnings", async () => {
+    // The resolver is a Sonnet call. It should only run when there is
+    // something to triage.
+    runProducedACommit();
+    scoutMod.scoutTask.mockResolvedValue({
+      result: { model: "sonnet", estimatedTurns: 3, scopeWarnings: [] },
+      hasScopeWarnings: false,
+      failure: null,
+      cached: false,
+    });
+
+    await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+    expect(resolverMod.resolveScoutScope).not.toHaveBeenCalled();
+    expect(runner.runTask).toHaveBeenCalledTimes(1);
+  });
+
+  describe("when the scout raises warnings", () => {
+    beforeEach(() => {
+      scoutMod.scoutTask.mockResolvedValue({
+        result: {
+          model: "opus",
+          estimatedTurns: 12,
+          scopeWarnings: ["unbounded refactor", "ambiguous target"],
+        },
+        hasScopeWarnings: true,
+        failure: null,
+        cached: false,
+      });
+    });
+
+    it("goes straight to approval under manual mode, without paying for a resolver", async () => {
+      await executeRun(mkCfg("manual"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      expect(resolverMod.resolveScoutScope).not.toHaveBeenCalled();
+      expect(runner.runTask).not.toHaveBeenCalled();
+      expect(terminalStatus()).toBe("awaiting-approval");
+    });
+
+    it("skip: fails with the dedup-prefixed blocker and never spawns", async () => {
+      // The "no commit produced" prefix is load-bearing, not cosmetic:
+      // recentlyNoopTaskIds matches on it to keep the picker from
+      // re-selecting this task on the very next tick.
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: { verdict: "skip", explanation: "dependency not ready" },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      expect(runner.runTask).not.toHaveBeenCalled();
+      expect(terminalStatus()).toBe("failed");
+      const fields = journal.setRunFields.mock.calls.at(-1)?.[1] as {
+        blocker?: string;
+      };
+      expect(fields.blocker).toMatch(/^no commit produced/);
+      expect(fields.blocker).toMatch(/dependency not ready/);
+    });
+
+    it("escalate: holds for approval and never spawns", async () => {
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: { verdict: "escalate", explanation: "product direction call" },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      expect(runner.runTask).not.toHaveBeenCalled();
+      expect(terminalStatus()).toBe("awaiting-approval");
+      expect(journal.blockBacklogItemForOperatorAction).not.toHaveBeenCalled();
+    });
+
+    it("block: fails the run AND flips the backlog item, with the prefix stripped", async () => {
+      // Distinct from escalate on purpose. A blocked item has no Ship/Skip
+      // decision for an operator to make, so it belongs in the backlog's
+      // blocked section rather than on the approvals queue.
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: { verdict: "block", explanation: "needs browser auth" },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(
+        mkCfg("auto"),
+        mkAdapter(),
+        mkComplexPick({ taskId: "backlog:item-42" }),
+        OK_BUDGET,
+      );
+
+      expect(runner.runTask).not.toHaveBeenCalled();
+      expect(terminalStatus()).toBe("failed");
+      expect(journal.blockBacklogItemForOperatorAction).toHaveBeenCalledTimes(1);
+      const [backlogId, meta] =
+        journal.blockBacklogItemForOperatorAction.mock.calls[0] ?? [];
+      // The row id, not the queue-prefixed taskId.
+      expect(backlogId).toBe("item-42");
+      expect((meta as { reason?: string })?.reason).toBe("needs browser auth");
+    });
+
+    it("block: does not try to flip a non-backlog pick", async () => {
+      // Creative and refactor picks have no backlog row behind them.
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: { verdict: "block", explanation: "needs browser auth" },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(
+        mkCfg("auto"),
+        mkAdapter(),
+        mkComplexPick({ taskId: "creative:abc123" }),
+        OK_BUDGET,
+      );
+
+      expect(terminalStatus()).toBe("failed");
+      expect(journal.blockBacklogItemForOperatorAction).not.toHaveBeenCalled();
+    });
+
+    it("proceed: falls through and spawns the run", async () => {
+      // The proceed branch works by NOT returning. A future verdict added
+      // without its own return would silently inherit this fall-through.
+      runProducedACommit();
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: { verdict: "proceed", explanation: "technical scope only" },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      expect(runner.runTask).toHaveBeenCalledTimes(1);
+    });
+
+    it("proceed: a clarified scope replaces the prompt the run receives", async () => {
+      runProducedACommit();
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: {
+          verdict: "proceed",
+          explanation: "narrowed",
+          clarifiedScope: "rename publisher.ts only, leave callers alone",
+        },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      const spawned = runner.runTask.mock.calls[0]?.[0] as { prompt: string };
+      expect(spawned.prompt).toBe("rename publisher.ts only, leave callers alone");
+    });
+
+    it("proceed: acceptance criteria wrap the prompt in a capped goal", async () => {
+      // Uses the real applyGoalWrapper, so this pins the envelope the
+      // per-turn evaluator actually receives, not a stub's idea of it.
+      runProducedACommit();
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: {
+          verdict: "proceed",
+          explanation: "narrowed",
+          acceptanceCriteria: "npm test passes",
+        },
+        failure: null,
+        cached: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      const spawned = runner.runTask.mock.calls[0]?.[0] as { prompt: string };
+      expect(spawned.prompt).toMatch(/^\/goal npm test passes or stop after 5 turns/);
+      // The original task text survives after the envelope.
+      expect(spawned.prompt).toMatch(/migrate the publisher layer/);
+    });
+
+    it("a resolver failure escalates rather than proceeding", async () => {
+      // The fail-safe. An unparseable or timed-out resolver must not be
+      // read as permission to run: an operator is more annoyed by a
+      // needless approval click than by a missed safety net. Uses the real
+      // fallbackOnFailure.
+      resolverMod.resolveScoutScope.mockResolvedValue({
+        result: null,
+        failure: "resolver timed out after 60s",
+        cached: false,
+      });
+
+      await executeRun(mkCfg("auto"), mkAdapter(), mkComplexPick(), OK_BUDGET);
+
+      expect(runner.runTask).not.toHaveBeenCalled();
+      expect(terminalStatus()).toBe("awaiting-approval");
+      const fields = journal.setRunFields.mock.calls.at(-1)?.[1] as {
+        blocker?: string;
+      };
+      expect(fields.blocker).toMatch(/resolver timed out after 60s/);
+    });
   });
 });
 

@@ -10,7 +10,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Both jobs attach a Postgres service deliberately. 153 of this repo's 952
+# Both jobs attach a Postgres service deliberately. 153 of this repo's 973
 # tests are integration tests against a real database, gated on
 # OCEAN_BOT_TEST_DATABASE_URL so a contributor without Postgres can still
 # run `npm test`. Without the service in CI they skip silently: the summary
